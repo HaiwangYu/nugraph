@@ -13,8 +13,7 @@ from pytorch_lightning import LightningDataModule
 
 from ..data import NuGraphDataset, BalanceSampler
 
-DEFAULT_DATA = ("$NUGRAPH_DATA/uboone-opendata/"
-                "uboone-opendata-19be46d89d0f22f5a78641d724c1fedd.gnn.h5")
+DEFAULT_DATA = ("/exp/sbnd/app/users/yuhw/nugraph/test/NG2-paper.gnn.keep1.h5")
 
 class NuGraphDataModule(LightningDataModule):
     """PyTorch Lightning data module for neutrino graph data."""
@@ -137,21 +136,28 @@ class NuGraphDataModule(LightningDataModule):
             f.create_dataset('datasize/train', data=dsize)
 
     def train_dataloader(self) -> DataLoader:
-        if self.shuffle == 'balance':
+        train_len = len(self.train_dataset)
+        drop_last = train_len >= self.batch_size
+
+        if self.shuffle == 'balance' and drop_last:
             shuffle = False
             sampler = BalanceSampler.BalanceSampler(
                         datasize=self.train_datasize,
                         batch_size=self.batch_size,
                         balance_frac=self.balance_frac)
         else:
+            # fall back to standard shuffling when the dataset is too small
+            # for balanced sampling to produce at least one full batch
             shuffle = True
             sampler = None
 
         return DataLoader(self.train_dataset,
                           batch_size=self.batch_size,
                           num_workers=self.num_workers,
-                          sampler=sampler, drop_last=True,
-                          shuffle=shuffle, pin_memory=True)
+                          sampler=sampler,
+                          drop_last=drop_last,
+                          shuffle=shuffle,
+                          pin_memory=True)
 
     def val_dataloader(self) -> DataLoader:
         return DataLoader(self.val_dataset, num_workers=self.num_workers,

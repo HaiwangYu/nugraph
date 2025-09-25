@@ -1,4 +1,6 @@
 """Utility class for logging confusion matrices"""
+import tempfile
+
 import torchmetrics as tm
 from pytorch_lightning.loggers import Logger, TensorBoardLogger, WandbLogger
 import wandb
@@ -81,9 +83,12 @@ class ConfusionMatrixLogger:
         cm = matrix.compute().cpu()
         table = wandb.Table(columns=["plotly_figure"])
         fig = px.imshow(
-            cm, zmax=1, text_auto=True,
-            labels={"x": "Predicted", "y": "True", "color": label},
-            x=self.classes, y=self.classes)
+            cm,
+            zmax=1,
+            text_auto=True,
+            labels={"x": "Predicted", "y": "True", "color": "Support"},
+            x=self.classes,
+            y=self.classes)
         with tempfile.NamedTemporaryFile() as f:
             fig.write_html(f.name, auto_play=False)
             table.add_data(wandb.Html(f.name))
