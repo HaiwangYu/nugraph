@@ -32,11 +32,57 @@ def load_sample(record) -> dict[str, np.ndarray]:
 
 def semantic_palette(classes: list[str]) -> dict[str, str]:
     """Return a stable colour palette for semantic labels."""
-    base = plt.cm.get_cmap("tab10", len(classes))
     palette = {"background": "#b3b3b3"}
-    for idx, cls in enumerate(classes):
-        palette[cls] = mcolors.to_hex(base(idx))
+    if not classes:
+        return palette
+
+    base = plt.colormaps.get_cmap("tab10")
+    for val, cls in zip(np.linspace(0, 1, len(classes), endpoint=False), classes):
+        palette[cls] = mcolors.to_hex(base(val))
     return palette
+
+
+def infer_semantic_encoding(values: np.ndarray, classes: list[str]) -> tuple[int | None, int]:
+    """Infer background code and class offset from encoded semantic labels."""
+    if values.size == 0:
+        background = 0 if classes else None
+        offset = 1 if background == 0 else 0
+        return background, offset
+
+    codes = np.unique(values.astype(int))
+
+    background: int | None = None
+    negative_codes = codes[codes < 0]
+    if negative_codes.size:
+        background = int(negative_codes.min())
+    elif 0 in codes and codes.size > len(classes):
+        background = 0
+
+    positive_codes = codes if background is None else codes[codes != background]
+
+    if background == -1:
+        offset = 0
+    elif background == 0:
+        offset = 1
+    else:
+        offset = 1 if positive_codes.size and positive_codes.min() == 1 else 0
+
+    return background, offset
+
+
+def semantic_counts(values: np.ndarray, classes: list[str]) -> np.ndarray:
+    """Compute semantic label counts with dynamic encoding inference."""
+    background_code, offset = infer_semantic_encoding(values, classes)
+    counts = np.zeros(len(classes) + 1, dtype=int)
+
+    if background_code is not None:
+        counts[0] = np.count_nonzero(values == background_code)
+
+    for idx in range(len(classes)):
+        target = idx + offset
+        counts[idx + 1] = np.count_nonzero(values == target)
+
+    return counts
 
 
 def ensure_outdir(path: Path) -> None:
@@ -56,19 +102,34 @@ def plot_semantic_scatter(sample_name: str,
         axes = [axes]
 
     label_names = ["background"] + semantic_labels
+    label_order = {label: idx for idx, label in enumerate(label_names)}
 
     for ax, plane in zip(axes, planes):
         pos = data[f"{plane}/pos"]
         y_sem = data[f"{plane}/y_semantic"].astype(int)
-        labels = [label_names[val + 1] for val in y_sem]
-        colours = [palette[label] for label in labels]
+        background_code, offset = infer_semantic_encoding(y_sem, semantic_labels)
+
+        labels = []
+        for val in y_sem:
+            if background_code is not None and val == background_code:
+                label = "background"
+            else:
+                idx = val - offset
+                if 0 <= idx < len(semantic_labels):
+                    label = semantic_labels[idx]
+                else:
+                    label = "unknown"
+            labels.append(label)
+
+        colours = [palette.get(label, palette["background"]) for label in labels]
         ax.scatter(pos[:, 0], pos[:, 1], c=colours, s=5, linewidths=0)
         ax.set_title(f"{plane.upper()} plane")
         ax.set_xlabel("proj")
         ax.set_ylabel("drift")
 
-        unique_labels = sorted(set(labels), key=label_names.index)
-        handles = [plt.Line2D([0], [0], marker="o", linestyle="", color=palette[label], label=label) for label in unique_labels]
+        unique_labels = sorted(set(labels), key=lambda lbl: label_order.get(lbl, len(label_order)))
+        handles = [plt.Line2D([0], [0], marker="o", linestyle="", color=palette.get(label, palette["background"]), label=label)
+                   for label in unique_labels]
         ax.legend(handles=handles, fontsize="small", loc="upper right")
 
     fig.suptitle(f"Semantic truth labels – {sample_name}")
@@ -97,8 +158,9 @@ def plot_instance_scatter(sample_name: str,
         if len(valid_ids) == 0:
             colours = [background_color] * len(inst)
         else:
-            cmap = plt.cm.get_cmap("nipy_spectral", len(valid_ids))
-            colour_map = {val: cmap(i) for i, val in enumerate(valid_ids)}
+            cmap = plt.colormaps.get_cmap("nipy_spectral")
+            sample_points = np.linspace(0, 1, len(valid_ids), endpoint=False)
+            colour_map = {val: cmap(pt) for val, pt in zip(valid_ids, sample_points)}
             colours = [colour_map.get(val, background_color) for val in inst]
 
         ax.scatter(pos[:, 0], pos[:, 1], c=colours, s=5, linewidths=0)
@@ -188,11 +250,10 @@ def main() -> None:
             plot_semantic_scatter(sample, planes, semantic_labels, palette, record, sample_outdir)
             plot_instance_scatter(sample, planes, record, sample_outdir)
 
-            # update cumulative counts (shift by +1 to account for background)
+            # update cumulative counts using inferred encoding
             for plane in planes:
                 y_sem = record[f"{plane}/y_semantic"].astype(int)
-                counts = np.bincount(y_sem + 1, minlength=len(semantic_labels) + 1)
-                per_plane_counts[plane] += counts
+                per_plane_counts[plane] += semantic_counts(y_sem, semantic_labels)
 
         plot_semantic_summary(args.split, planes, semantic_labels, palette, per_plane_counts, args.outdir)
 
