@@ -138,15 +138,23 @@ def plot_ctpc(npz_path: Path,
         ax.set_ylabel("drift (mm)")
 
     if mappables:
-        fig.colorbar(mappables[0], ax=axes, label=colour_label, shrink=0.9)
+        # Give the colourbar a bit of breathing room so it stays outside the final panel
+        fig.colorbar(
+            mappables[0],
+            ax=axes,
+            label=colour_label,
+            shrink=0.9,
+            pad=0.02,
+            fraction=0.04,
+        )
 
     fig.suptitle(f"{npz_path.stem}: CTPC hits")
-    fig.subplots_adjust(top=0.85)
+    fig.subplots_adjust(top=0.85, right=0.94, wspace=0.25)
 
     dest_dir = outdir / npz_path.stem
     dest_dir.mkdir(parents=True, exist_ok=True)
     out_path = dest_dir / f"{npz_path.stem}_ctpc.png"
-    fig.savefig(out_path, bbox_inches="tight")
+    fig.savefig(out_path)
     plt.close(fig)
     print(f"[ok] wrote {out_path}")
 
