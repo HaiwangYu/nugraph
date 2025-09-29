@@ -80,8 +80,8 @@ def plot_projections(npz_path: Path, output: Path | None, dpi: int) -> None:
                 continue
             pitch = project_corners(corner_set, spec.angle_rad)
             ax.plot(
-                corner_set[:, 0],
                 pitch,
+                corner_set[:, 0],
                 marker="o",
                 linestyle="-",
                 linewidth=0.8,
@@ -90,8 +90,8 @@ def plot_projections(npz_path: Path, output: Path | None, dpi: int) -> None:
                 alpha=0.7,
             )
         ax.set_title(f"Plane {spec.name}")
-        ax.set_xlabel("Drift x [mm]")
-    axes[0].set_ylabel("Projected pitch [mm]")
+        ax.set_xlabel("Projected pitch [mm]")
+    axes[0].set_ylabel("Drift x [mm]")
     handles = [
         plt.Line2D([0], [0], color="C0", label="background"),
         plt.Line2D([0], [0], color="C1", label="neutrino"),
