@@ -35,7 +35,7 @@ class ConversionConfig:
     semantic_classes: tuple[str, ...] = ("nu",)
     train_fraction: float = 0.7
     val_fraction: float = 0.15
-    projection_tolerance: float = 10.0  # mm tolerance between projected and observed wire coordinates
+    projection_tolerance: float = 0.0  # mm tolerance between projected and observed wire coordinates
     pitch_gap_tolerance: float = 6.0  # mm gap that breaks contiguous CTPC stripes into distinct nodes
 
     def plane_names(self) -> tuple[str, ...]:

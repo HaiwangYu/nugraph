@@ -277,33 +277,19 @@ class WCMLConverter:
         to_sp: List[Tuple[int, int]] = []
         node_semantics: List[List[int]] = [[] for _ in range(len(positions))]
 
+        node_x = pos_array[:, 0]
         for blob_id, corner_set in enumerate(corners):
             projected = project_corners(corner_set, spec.angle_rad)
             if not projected.size:
                 continue
-            mask = np.abs(ctpc[:, 0] - centroid[blob_id, 0]) <= x_tol
-            nearby = ctpc[mask]
-            if nearby.size:
-                scale = estimate_unit_scale(projected, nearby[:, 1], self.config.unit_ratio_threshold)
-                if not np.isclose(scale, 1.0):
-                    projected = projected * scale
-                    warnings.warn(
-                        f"Rescaled blob {blob_id} on plane {spec.name} by factor {scale:.2f} to match CTPC units.",
-                        RuntimeWarning,
-                    )
-                delta = abs(projected.mean() - nearby[:, 1].mean())
-                if delta > self.config.projection_tolerance:
-                    warnings.warn(
-                        (
-                            f"Blob {blob_id} projection mismatch on plane {spec.name}: "
-                            f"|Δ|={delta:.2f} mm exceeds tolerance {self.config.projection_tolerance:.2f} mm"
-                        ),
-                        RuntimeWarning,
-                    )
 
-            lower_expand = -np.inf
-            upper_expand = np.inf
-            for node_idx, (pitch_min, pitch_max) in enumerate(pitch_ranges):
+            candidate_mask = np.abs(node_x - centroid[blob_id, 0]) <= x_tol
+            candidate_indices = np.nonzero(candidate_mask)[0]
+            if not candidate_indices.size:
+                continue
+
+            for node_idx in candidate_indices:
+                pitch_min, pitch_max = pitch_ranges[node_idx]
                 lower_expand = pitch_min - self.config.projection_tolerance
                 upper_expand = pitch_max + self.config.projection_tolerance
                 if np.any((projected >= lower_expand) & (projected <= upper_expand)):

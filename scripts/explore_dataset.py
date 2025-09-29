@@ -163,7 +163,7 @@ def plot_instance_scatter(sample_name: str,
             colour_map = {val: cmap(pt) for val, pt in zip(valid_ids, sample_points)}
             colours = [colour_map.get(val, background_color) for val in inst]
 
-        ax.scatter(pos[:, 0], pos[:, 1], c=colours, s=5, linewidths=0)
+        ax.scatter(pos[:, 1], pos[:, 0], c=colours, s=5, linewidths=0)
 
         # Plot ground-truth interaction vertices if present
         vtx_key = f"{plane}/y_vtx"
