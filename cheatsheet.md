@@ -13,7 +13,9 @@ Adjust `--tolerance` (drift match) and `--projection-tolerance` (wire match) if 
 
 
 ```bash
-python scripts/explore_dataset.py /exp/sbnd/app/users/yuhw/nugraph/pywcml/sample/rec-lab-apa0-0.h5        --split test --limit 3 --outdir plots_demo
+python scripts/explore_dataset.py \
+/exp/sbnd/app/users/yuhw/nugraph/pywcml/sample/rec-lab-apa0-0.h5 \
+--split test --limit 3 --outdir plots_demo
 ```
 
 ```bash

@@ -122,7 +122,7 @@ def plot_semantic_scatter(sample_name: str,
             labels.append(label)
 
         colours = [palette.get(label, palette["background"]) for label in labels]
-        ax.scatter(pos[:, 0], pos[:, 1], c=colours, s=5, linewidths=0)
+        ax.scatter(pos[:, 1], pos[:, 0], c=colours, s=5, linewidths=0)
         ax.set_title(f"{plane.upper()} plane")
         ax.set_xlabel("proj")
         ax.set_ylabel("drift")

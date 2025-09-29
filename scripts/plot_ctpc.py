@@ -137,16 +137,16 @@ def plot_ctpc(npz_path: Path,
         ax.set_xlabel("wire (mm)")
         ax.set_ylabel("drift (mm)")
 
-    if mappables:
-        # Give the colourbar a bit of breathing room so it stays outside the final panel
-        fig.colorbar(
-            mappables[0],
-            ax=axes,
-            label=colour_label,
-            shrink=0.9,
-            pad=0.02,
-            fraction=0.04,
-        )
+    # if mappables:
+    #     # Give the colourbar a bit of breathing room so it stays outside the final panel
+    #     fig.colorbar(
+    #         mappables[0],
+    #         ax=axes,
+    #         label=colour_label,
+    #         shrink=0.9,
+    #         pad=0.02,
+    #         fraction=0.04,
+    #     )
 
     fig.suptitle(f"{npz_path.stem}: CTPC hits")
     fig.subplots_adjust(top=0.85, right=0.94, wspace=0.25)

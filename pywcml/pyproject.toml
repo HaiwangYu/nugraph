@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pywcml"
+version = "0.1.0"
+description = "Utilities for converting Wire-Cell ML NPZ files into NuGraph-compatible datasets."
+readme = "README.md"
+authors = [
+  { name = "SBND Collaboration" }
+]
+license = { text = "BSD-3-Clause" }
+requires-python = ">=3.9"
+dependencies = [
+  "numpy",
+  "torch",
+  "h5py",
+  "matplotlib",
+]
+
+[project.urls]
+Homepage = "https://github.com/sbnd/nugraph"
+
+[project.scripts]
+wcml-to-h5 = "pywcml.cli:main"
+
+[tool.setuptools]
+packages = ["pywcml"]
+
+[tool.setuptools.package-dir]
+pywcml = "."
