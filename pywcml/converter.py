@@ -104,7 +104,7 @@ class WCMLConverter:
             if ctpc is None:
                 plane_nodes[spec.name] = PlaneNodes(
                     pos=np.empty((0, 2), dtype=np.float32),
-                    features=np.empty((0, 3), dtype=np.float32),
+                    features=np.empty((0, 5), dtype=np.float32),
                     labels=np.empty((0,), dtype=np.int64),
                     instances=np.empty((0,), dtype=np.int64),
                     to_sp=np.empty((0, 2), dtype=np.int64),
@@ -128,7 +128,7 @@ class WCMLConverter:
             if nodes is None:
                 nodes = PlaneNodes(
                     pos=np.empty((0, 2), dtype=np.float32),
-                    features=np.empty((0, 3), dtype=np.float32),
+                    features=np.empty((0, 5), dtype=np.float32),
                     labels=np.empty((0,), dtype=np.int64),
                     instances=np.empty((0,), dtype=np.int64),
                     to_sp=np.empty((0, 2), dtype=np.int64),
@@ -196,70 +196,138 @@ class WCMLConverter:
                      corners: Sequence[np.ndarray],
                      centroid: np.ndarray,
                      semantic: np.ndarray) -> PlaneNodes:
+        if not ctpc.size:
+            return PlaneNodes(
+                pos=np.empty((0, 2), dtype=np.float32),
+                features=np.empty((0, 5), dtype=np.float32),
+                labels=np.empty((0,), dtype=np.int64),
+                instances=np.empty((0,), dtype=np.int64),
+                to_sp=np.empty((0, 2), dtype=np.int64),
+                edges=np.empty((2, 0), dtype=np.int64),
+            )
+
+        x_tol = self.config.x_tolerance
+        pitch_tol = self.config.pitch_gap_tolerance
+
+        order = np.argsort(ctpc[:, 0])
+        sorted_points = ctpc[order]
+        x_groups: List[np.ndarray] = []
+        current: List[np.ndarray] = []
+        current_ref = None
+        for point in sorted_points:
+            x_val = point[0]
+            if not current:
+                current = [point]
+                current_ref = x_val
+                continue
+            if abs(x_val - current_ref) <= x_tol:
+                current.append(point)
+                current_ref = (current_ref * (len(current) - 1) + x_val) / len(current)
+            else:
+                x_groups.append(np.asarray(current))
+                current = [point]
+                current_ref = x_val
+        if current:
+            x_groups.append(np.asarray(current))
+
         positions: List[List[float]] = []
         features: List[List[float]] = []
-        labels: List[int] = []
-        instances: List[int] = []
+        pitch_ranges: List[Tuple[float, float]] = []
+
+        def add_node(points_slice: np.ndarray) -> None:
+            if not points_slice.size:
+                return
+            charges = points_slice[:, 2]
+            total_charge = float(charges.sum())
+            weights = charges if total_charge > 0.0 else np.ones_like(charges)
+            wx = float(np.average(points_slice[:, 0], weights=weights))
+            wy = float(np.average(points_slice[:, 1], weights=weights))
+            mean_charge_err = float(points_slice[:, 3].mean())
+            nhits = float(points_slice.shape[0])
+            pitch_min = float(points_slice[:, 1].min())
+            pitch_max = float(points_slice[:, 1].max())
+            positions.append([wx, wy])
+            features.append([total_charge, mean_charge_err, nhits, pitch_min, pitch_max])
+            pitch_ranges.append((pitch_min, pitch_max))
+
+        for group in x_groups:
+            if group.size == 0:
+                continue
+            group_sorted = group[np.argsort(group[:, 1])]
+            start = 0
+            for idx in range(1, group_sorted.shape[0]):
+                if group_sorted[idx, 1] - group_sorted[idx - 1, 1] > pitch_tol:
+                    add_node(group_sorted[start:idx])
+                    start = idx
+            add_node(group_sorted[start:])
+
+        if not positions:
+            return PlaneNodes(
+                pos=np.empty((0, 2), dtype=np.float32),
+                features=np.empty((0, 5), dtype=np.float32),
+                labels=np.empty((0,), dtype=np.int64),
+                instances=np.empty((0,), dtype=np.int64),
+                to_sp=np.empty((0, 2), dtype=np.int64),
+                edges=np.empty((2, 0), dtype=np.int64),
+            )
+
+        pos_array = np.asarray(positions, dtype=np.float32)
+        feat_array = np.asarray(features, dtype=np.float32)
+
         to_sp: List[Tuple[int, int]] = []
+        node_semantics: List[List[int]] = [[] for _ in range(len(positions))]
 
         for blob_id, corner_set in enumerate(corners):
-            mask = np.abs(ctpc[:, 0] - centroid[blob_id, 0]) <= self.config.x_tolerance
-            plane_points = ctpc[mask]
-            if not plane_points.size:
-                continue
-
             projected = project_corners(corner_set, spec.angle_rad)
-            scale = estimate_unit_scale(projected, plane_points[:, 1], self.config.unit_ratio_threshold)
-            if not np.isclose(scale, 1.0):
-                projected *= scale
-                warnings.warn(
-                    f"Rescaled blob {blob_id} on plane {spec.name} by factor {scale:.2f} to match CTPC units.",
-                    RuntimeWarning,
-                )
+            if not projected.size:
+                continue
+            mask = np.abs(ctpc[:, 0] - centroid[blob_id, 0]) <= x_tol
+            nearby = ctpc[mask]
+            if nearby.size:
+                scale = estimate_unit_scale(projected, nearby[:, 1], self.config.unit_ratio_threshold)
+                if not np.isclose(scale, 1.0):
+                    projected = projected * scale
+                    warnings.warn(
+                        f"Rescaled blob {blob_id} on plane {spec.name} by factor {scale:.2f} to match CTPC units.",
+                        RuntimeWarning,
+                    )
+                delta = abs(projected.mean() - nearby[:, 1].mean())
+                if delta > self.config.projection_tolerance:
+                    warnings.warn(
+                        (
+                            f"Blob {blob_id} projection mismatch on plane {spec.name}: "
+                            f"|Δ|={delta:.2f} mm exceeds tolerance {self.config.projection_tolerance:.2f} mm"
+                        ),
+                        RuntimeWarning,
+                    )
 
-            delta = abs(projected.mean() - plane_points[:, 1].mean())
-            if delta > self.config.projection_tolerance:
-                warnings.warn(
-                    (
-                        f"Blob {blob_id} projection mismatch on plane {spec.name}: "
-                        f"|Δ|={delta:.2f} mm exceeds tolerance {self.config.projection_tolerance:.2f} mm"
-                    ),
-                    RuntimeWarning,
-                )
+            lower_expand = -np.inf
+            upper_expand = np.inf
+            for node_idx, (pitch_min, pitch_max) in enumerate(pitch_ranges):
+                lower_expand = pitch_min - self.config.projection_tolerance
+                upper_expand = pitch_max + self.config.projection_tolerance
+                if np.any((projected >= lower_expand) & (projected <= upper_expand)):
+                    to_sp.append((node_idx, blob_id))
+                    node_semantics[node_idx].append(int(semantic[blob_id]))
 
-            pos_x = plane_points[:, 0].mean()
-            pos_y = plane_points[:, 1].mean()
-            positions.append([pos_x, pos_y])
+        labels = np.full(len(positions), self.config.semantic_negative, dtype=np.int64)
+        for node_idx, linked_labels in enumerate(node_semantics):
+            if not linked_labels:
+                continue
+            if any(lbl == self.config.semantic_positive for lbl in linked_labels):
+                labels[node_idx] = self.config.semantic_positive
+            else:
+                labels[node_idx] = linked_labels[0]
 
-            total_charge = float(plane_points[:, 2].sum())
-            mean_charge_err = float(plane_points[:, 3].mean())
-            nhits = float(len(plane_points))
-            features.append([total_charge, mean_charge_err, nhits])
-
-            labels.append(int(semantic[blob_id]))
-            instances.append(0)
-            to_sp.append((len(positions) - 1, blob_id))
-
-        if positions:
-            pos_array = np.asarray(positions, dtype=np.float32)
-            feat_array = np.asarray(features, dtype=np.float32)
-            label_array = np.asarray(labels, dtype=np.int64)
-            inst_array = np.asarray(instances, dtype=np.int64)
-            edges = triangulation_edges(pos_array)
-            to_sp_arr = np.asarray(to_sp, dtype=np.int64)
-        else:
-            pos_array = np.empty((0, 2), dtype=np.float32)
-            feat_array = np.empty((0, 3), dtype=np.float32)
-            label_array = np.empty((0,), dtype=np.int64)
-            inst_array = np.empty((0,), dtype=np.int64)
-            edges = np.empty((2, 0), dtype=np.int64)
-            to_sp_arr = np.empty((0, 2), dtype=np.int64)
+        instances = np.zeros(len(positions), dtype=np.int64)
+        edges = triangulation_edges(pos_array)
+        to_sp_arr = np.asarray(to_sp, dtype=np.int64) if to_sp else np.empty((0, 2), dtype=np.int64)
 
         return PlaneNodes(
             pos=pos_array,
             features=feat_array,
-            labels=label_array,
-            instances=inst_array,
+            labels=labels,
+            instances=instances,
             to_sp=to_sp_arr,
             edges=edges,
         )
