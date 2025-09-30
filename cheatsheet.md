@@ -18,10 +18,10 @@ rec-lab-apa0-0.h5, 23334072_0.h5
 ```bash
 python scripts/explore_dataset.py \
 /exp/sbnd/app/users/yuhw/nugraph/pywcml/sample/23334072_0.h5 \
---split test --limit 3 --outdir plots_demo
+--split test --limit 1 --outdir plots_demo
 ```
 
 ```bash
 python scripts/plot_ctpc.py pywcml/sample/23334072_0/rec-lab-apa1-0.npz
-python scripts/plot_blob_projections.py pywcml/sample/23334072_0/rec-lab-apa1-0.npz
+python scripts/plot_blob_projections.py pywcml/sample/23334072_0/rec-lab-apa1-23.npz
 ```
