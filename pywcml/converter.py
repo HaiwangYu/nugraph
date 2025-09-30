@@ -49,8 +49,14 @@ class WCMLConverter:
 
     def convert_many(self, paths: Sequence[Path | str]) -> Dict[str, NuGraphData]:
         graphs = {}
-        for path in paths:
-            print(f"[info] converting {path}")
+        iterator = paths
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(paths, desc="Converting", unit="file")
+        except Exception:
+            iterator = paths
+
+        for path in iterator:
             name, data = self.convert(path)
             graphs[name] = data
         return graphs
