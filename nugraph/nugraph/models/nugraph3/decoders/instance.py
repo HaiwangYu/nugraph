@@ -114,8 +114,16 @@ class InstanceDecoder(nn.Module):
             data[N_IP].x, data[E_H_IP].edge_index = self.materialize(h.ox, mask)
             rand = adjusted_rand_score(data.x_i(), data.y_i())
 
-        if not -1. < rand < 1.:
-            raise RuntimeError(f"Adjusted Rand Score metric value {rand} is outside allowed range!")
+        if isinstance(rand, torch.Tensor):
+            rand_val = float(rand.detach().cpu().item())
+        else:
+            rand_val = float(rand)
+        if rand_val < -1.0 - 1e-6 or rand_val > 1.0 + 1e-6:
+            raise RuntimeError(f"Adjusted Rand Score metric value {rand_val} is outside allowed range!")
+        if isinstance(rand, torch.Tensor):
+            rand = rand.clamp_(-1.0, 1.0)
+        else:
+            rand = max(min(rand_val, 1.0), -1.0)
 
         if stage:
             metrics[f"instance/adjusted-rand-{stage}"] = rand
