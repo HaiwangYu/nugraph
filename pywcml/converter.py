@@ -1,11 +1,12 @@
 """Convert WCML NPZ files into NuGraph-compatible HDF5 datasets."""
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import warnings
 from pathlib import Path
 import re
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, Iterable, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -31,6 +32,9 @@ class PlaneNodes:
 RUN_SUBRUN_PATTERN = re.compile(r"(?P<run>\d+)_(?P<subrun>\d+)")
 
 
+_WORKER_CONVERTER = None
+
+
 class WCMLConverter:
     """Convert WCML NPZ archives into NuGraph graphs and packaged HDF5 files."""
 
@@ -47,18 +51,29 @@ class WCMLConverter:
         graph = self._build_graph(graph_name, arrays)
         return graph_name, graph
 
-    def convert_many(self, paths: Sequence[Path | str]) -> Dict[str, NuGraphData]:
-        graphs = {}
-        iterator = paths
-        try:
-            from tqdm import tqdm
-            iterator = tqdm(paths, desc="Converting", unit="file")
-        except Exception:
-            iterator = paths
+    def convert_many(self, paths: Sequence[Path | str], workers: int | None = None) -> Dict[str, NuGraphData]:
+        graphs: Dict[str, NuGraphData] = {}
+        path_list = [Path(p) for p in paths]
+        if not path_list:
+            return graphs
 
-        for path in iterator:
-            name, data = self.convert(path)
-            graphs[name] = data
+        worker_count = max(1, int(workers or 1))
+
+        if worker_count == 1:
+            iterator = self._progress(path_list, total=len(path_list))
+            for path in iterator:
+                name, data = self.convert(path)
+                graphs[name] = data
+            return graphs
+
+        str_paths = [str(p) for p in path_list]
+        with ProcessPoolExecutor(max_workers=worker_count,
+                                 initializer=_init_worker,
+                                 initargs=(self.config,)) as executor:
+            results: Iterable[tuple[str, NuGraphData]] = executor.map(_convert_worker, str_paths)
+            results = self._progress(results, total=len(path_list))
+            for name, data in results:
+                graphs[name] = data
         return graphs
 
     def write_hdf5(self,
@@ -400,6 +415,13 @@ class WCMLConverter:
                 return int(part)
         return None
 
+    def _progress(self, iterable: Iterable, total: int | None = None) -> Iterable:
+        try:
+            from tqdm import tqdm  # type: ignore
+        except Exception:
+            return iterable
+        return tqdm(iterable, total=total, desc="Converting", unit="file")
+
     def _graph_sizes(self, graphs: Dict[str, NuGraphData], names: Sequence[str]) -> np.ndarray:
         if not names:
             return np.zeros((0,), dtype=np.int64)
@@ -415,6 +437,17 @@ class WCMLConverter:
         return np.asarray(sizes, dtype=np.int64)
 
 
+def _init_worker(config: ConversionConfig) -> None:
+    global _WORKER_CONVERTER
+    _WORKER_CONVERTER = WCMLConverter(config)
+
+
+def _convert_worker(path: str) -> tuple[str, NuGraphData]:
+    if _WORKER_CONVERTER is None:
+        raise RuntimeError("Worker converter not initialized")
+    return _WORKER_CONVERTER.convert(Path(path))
+
+
 def convert_npz_file(npz_path: Path | str,
                      output: Path | str,
                      config: ConversionConfig | None = None) -> Path:
@@ -426,11 +459,12 @@ def convert_npz_file(npz_path: Path | str,
 
 def convert_npz_directory(directory: Path | str,
                           output: Path | str,
-                          config: ConversionConfig | None = None) -> Path:
+                          config: ConversionConfig | None = None,
+                          workers: int | None = None) -> Path:
     converter = WCMLConverter(config)
     directory = Path(directory)
     paths = sorted(p for p in directory.rglob("*.npz") if p.is_file())
-    graphs = converter.convert_many(paths)
+    graphs = converter.convert_many(paths, workers=workers)
     converter.write_hdf5(graphs, output)
     return Path(output)
 

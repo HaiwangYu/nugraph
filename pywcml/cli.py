@@ -43,6 +43,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0.15,
         help="Fraction of samples assigned to the validation split",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes to use",
+    )
     return parser.parse_args(argv)
 
 
@@ -59,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
         paths = _collect_npz_files(args.source)
         if not paths:
             raise SystemExit(f"no NPZ files found under {args.source}")
-        graphs = converter.convert_many(paths)
+        graphs = converter.convert_many(paths, workers=args.workers)
         converter.write_hdf5(graphs, args.output)
     else:
         name, graph = converter.convert(args.source)
