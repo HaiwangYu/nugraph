@@ -56,7 +56,10 @@ def main(argv: list[str] | None = None) -> None:
     )
     converter = WCMLConverter(config)
     if args.source.is_dir():
-        graphs = converter.convert_many(sorted(args.source.glob("*.npz")))
+        paths = _collect_npz_files(args.source)
+        if not paths:
+            raise SystemExit(f"no NPZ files found under {args.source}")
+        graphs = converter.convert_many(paths)
         converter.write_hdf5(graphs, args.output)
     else:
         name, graph = converter.convert(args.source)
@@ -65,3 +68,8 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
+
+
+def _collect_npz_files(base: Path) -> list[Path]:
+    files = sorted(p for p in base.rglob("*.npz") if p.is_file())
+    return files

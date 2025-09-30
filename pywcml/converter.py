@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import warnings
 from pathlib import Path
+import re
 from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
@@ -27,6 +28,9 @@ class PlaneNodes:
     edges: np.ndarray
 
 
+RUN_SUBRUN_PATTERN = re.compile(r"(?P<run>\d+)_(?P<subrun>\d+)")
+
+
 class WCMLConverter:
     """Convert WCML NPZ archives into NuGraph graphs and packaged HDF5 files."""
 
@@ -36,9 +40,10 @@ class WCMLConverter:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def convert(self, npz_path: Path | str) -> tuple[str, NuGraphData]:
-        arrays = load_npz(npz_path)
-        graph_name = arrays.path.stem
+    def convert(self, npz_path: Path | str, sample_name: str | None = None) -> tuple[str, NuGraphData]:
+        path = Path(npz_path)
+        arrays = load_npz(path)
+        graph_name = sample_name or self._default_sample_name(path)
         graph = self._build_graph(graph_name, arrays)
         return graph_name, graph
 
@@ -117,7 +122,7 @@ class WCMLConverter:
             plane_nodes[spec.name] = self._build_plane(spec, ctpc, corners, centroids, semantic)
 
         graph = NuGraphData()
-        run, subrun, event = self._infer_event_ids(sample_name)
+        run, subrun, event = self._infer_event_ids(sample_name, arrays.path)
         graph["metadata"].run = run
         graph["metadata"].subrun = subrun
         graph["metadata"].event = event
@@ -334,20 +339,60 @@ class WCMLConverter:
             edges=edges,
         )
 
-    def _infer_event_ids(self, sample_name: str) -> tuple[int, int, int]:
-        parts = sample_name.split('-')
+    def _infer_event_ids(self, sample_name: str, source_path: Path | None = None) -> tuple[int, int, int]:
         run = 0
         subrun = 0
         event = 0
+
+        if source_path is not None:
+            run_subrun = self._extract_run_subrun(source_path)
+            if run_subrun is not None:
+                run, subrun = run_subrun
+            event_id = self._extract_event_id(source_path)
+            if event_id is not None:
+                event = event_id
+
+        if run == 0 or subrun == 0:
+            match = RUN_SUBRUN_PATTERN.search(sample_name)
+            if match:
+                if run == 0:
+                    run = int(match.group("run"))
+                if subrun == 0:
+                    subrun = int(match.group("subrun"))
+
+        parts = sample_name.split('-')
         for part in parts:
-            if part.startswith("apa"):
+            if subrun == 0 and part.startswith("apa"):
                 try:
                     subrun = int(part.replace("apa", ""))
                 except ValueError:
                     pass
-            elif part.isdigit():
+            elif event == 0 and part.isdigit():
                 event = int(part)
+
         return run, subrun, event
+
+    def _default_sample_name(self, path: Path) -> str:
+        run_subrun = self._extract_run_subrun(path)
+        base = path.stem
+        if run_subrun is not None:
+            run, subrun = run_subrun
+            return f"{run}_{subrun}_{base}"
+        return base
+
+    def _extract_run_subrun(self, path: Path) -> tuple[int, int] | None:
+        for parent in path.parents:
+            match = RUN_SUBRUN_PATTERN.fullmatch(parent.name)
+            if match:
+                return int(match.group("run")), int(match.group("subrun"))
+        return None
+
+    def _extract_event_id(self, path: Path) -> int | None:
+        stem_parts = path.stem.split('-')
+        for part in reversed(stem_parts):
+            if part.isdigit():
+                return int(part)
+        return None
 
     def _graph_sizes(self, graphs: Dict[str, NuGraphData], names: Sequence[str]) -> np.ndarray:
         if not names:
@@ -378,7 +423,7 @@ def convert_npz_directory(directory: Path | str,
                           config: ConversionConfig | None = None) -> Path:
     converter = WCMLConverter(config)
     directory = Path(directory)
-    paths = sorted(directory.glob("*.npz"))
+    paths = sorted(p for p in directory.rglob("*.npz") if p.is_file())
     graphs = converter.convert_many(paths)
     converter.write_hdf5(graphs, output)
     return Path(output)
