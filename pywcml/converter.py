@@ -99,8 +99,9 @@ class WCMLConverter:
         charges, centroids, corners = self._extract_blobs(arrays.blobs)
         semantic = self._label_blobs(arrays.points, arrays.is_nu, len(corners), self.config)
 
+        planes = self.config.planes_for_sample(sample_name)
         plane_nodes: Dict[str, PlaneNodes] = {}
-        for key, spec in self.config.planes.items():
+        for key, spec in planes.items():
             ctpc = arrays.ctpc.get(key)
             if ctpc is None:
                 plane_nodes[spec.name] = PlaneNodes(

@@ -14,16 +14,26 @@ class PlaneSpec:
     angle_rad: float
 
 
-def default_planes() -> Dict[str, PlaneSpec]:
-    """Return the default plane configuration for SBND field cage 0."""
-    specs: Iterable[tuple[str, str, float]] = (
-        ("ctpc_f0p0", "u", radians(+60.0)),
-        ("ctpc_f0p1", "v", radians(-60.0)),
-        ("ctpc_f0p2", "y", radians(0.0)),
-        ("ctpc_f1p0", "u", radians(-60.0)),
-        ("ctpc_f1p1", "v", radians(+60.0)),
-        ("ctpc_f1p2", "y", radians(0.0)),
-    )
+def default_planes(apa: int | str = 0) -> Dict[str, PlaneSpec]:
+    """Return the default plane configuration for the requested SBND APA."""
+    apa_label = str(apa).lower()
+    if apa_label.startswith("apa"):
+        apa_label = apa_label[3:]
+
+    specs: Iterable[tuple[str, str, float]]
+    if apa_label == "1":
+        specs = (
+            ("ctpc_f1p0", "u", radians(-60.0)),
+            ("ctpc_f1p1", "v", radians(+60.0)),
+            ("ctpc_f1p2", "y", radians(0.0)),
+        )
+    else:
+        specs = (
+            ("ctpc_f0p0", "u", radians(+60.0)),
+            ("ctpc_f0p1", "v", radians(-60.0)),
+            ("ctpc_f0p2", "y", radians(0.0)),
+        )
+
     return {key: PlaneSpec(key=key, name=name, angle_rad=angle) for key, name, angle in specs}
 
 
@@ -40,9 +50,20 @@ class ConversionConfig:
     val_fraction: float = 0.15
     projection_tolerance: float = 0.0  # mm tolerance between projected and observed wire coordinates
     pitch_gap_tolerance: float = 6.0  # mm gap that breaks contiguous CTPC stripes into distinct nodes
+    detect_planes_from_name: bool = True
 
     def plane_names(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.planes.values())
+
+    def planes_for_sample(self, sample_name: str) -> Dict[str, PlaneSpec]:
+        """Return plane configuration, switching to APA1 when the name requests it."""
+        if not self.detect_planes_from_name:
+            return self.planes
+
+        if "apa1" in sample_name.lower():
+            return default_planes(1)
+
+        return self.planes
 
 
 __all__ = ["PlaneSpec", "ConversionConfig", "default_planes"]
