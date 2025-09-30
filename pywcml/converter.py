@@ -98,6 +98,7 @@ class WCMLConverter:
     def _build_graph(self, sample_name: str, arrays: WCMLArrays) -> NuGraphData:
         charges, centroids, corners = self._extract_blobs(arrays.blobs)
         semantic = self._label_blobs(arrays.points, arrays.is_nu, len(corners), self.config)
+        encoded_semantic = self._encode_semantic_labels(semantic)
 
         planes = self.config.planes_for_sample(sample_name)
         plane_nodes: Dict[str, PlaneNodes] = {}
@@ -123,7 +124,7 @@ class WCMLConverter:
 
         graph["sp"].pos = torch.as_tensor(centroids, dtype=torch.float32)
         graph["sp"].q = torch.as_tensor(charges, dtype=torch.float32)
-        graph["sp"].y_semantic = torch.as_tensor(semantic, dtype=torch.long)
+        graph["sp"].y_semantic = torch.as_tensor(encoded_semantic, dtype=torch.long)
 
         for plane_name in self.config.plane_names():
             nodes = plane_nodes.get(plane_name)
@@ -191,6 +192,17 @@ class WCMLConverter:
             blob_labels = is_nu[mask]
             labels[blob_id] = config.semantic_positive if (blob_labels == config.semantic_positive).any() else config.semantic_negative
         return labels
+
+    def _encode_semantic_labels(self, labels: np.ndarray) -> np.ndarray:
+        """Map raw semantic values to class indices used downstream."""
+        encoded = np.full(labels.shape, -1, dtype=np.int64)
+        positive_mask = labels == self.config.semantic_positive
+        if positive_mask.any():
+            encoded[positive_mask] = 0
+        negative_mask = labels == self.config.semantic_negative
+        if negative_mask.any():
+            encoded[negative_mask] = 1
+        return encoded
 
     def _build_plane(self,
                      spec: PlaneSpec,
@@ -311,10 +323,12 @@ class WCMLConverter:
         edges = triangulation_edges(pos_array)
         to_sp_arr = np.asarray(to_sp, dtype=np.int64) if to_sp else np.empty((0, 2), dtype=np.int64)
 
+        encoded_labels = self._encode_semantic_labels(labels)
+
         return PlaneNodes(
             pos=pos_array,
             features=feat_array,
-            labels=labels,
+            labels=encoded_labels,
             instances=instances,
             to_sp=to_sp_arr,
             edges=edges,

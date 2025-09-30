@@ -67,12 +67,17 @@ def plot_projections(npz_path: Path, output: Path | None, dpi: int) -> None:
     corners = extract_blob_corners(arrays.blobs)
     labels = infer_blob_labels(arrays.points, arrays.is_nu, len(corners), config)
 
+    encoded_labels = np.full(labels.shape, -1, dtype=np.int64)
+    encoded_labels[labels == config.semantic_positive] = 0
+    encoded_labels[labels == config.semantic_negative] = 1
+
     plane_specs = list(config.planes.values())
     fig, axes = plt.subplots(1, len(plane_specs), figsize=(4 * len(plane_specs), 4), sharey=True)
     if not isinstance(axes, np.ndarray):
         axes = np.array([axes])
 
-    colours = {config.semantic_negative: "C0", config.semantic_positive: "C1"}
+    class_colours = {idx: f"C{idx + 1}" for idx in range(len(config.semantic_classes))}
+    unknown_colour = "C0"
 
     for ax, spec in zip(axes, plane_specs):
         for blob_id, corner_set in enumerate(corners):
@@ -86,16 +91,17 @@ def plot_projections(npz_path: Path, output: Path | None, dpi: int) -> None:
                 linestyle="-",
                 linewidth=0.8,
                 markersize=3,
-                color=colours.get(labels[blob_id], "C2"),
+                color=class_colours.get(encoded_labels[blob_id], unknown_colour),
                 alpha=0.7,
             )
         ax.set_title(f"Plane {spec.name}")
         ax.set_xlabel("Projected pitch [mm]")
     axes[0].set_ylabel("Drift x [mm]")
-    handles = [
-        plt.Line2D([0], [0], color="C0", label="background"),
-        plt.Line2D([0], [0], color="C1", label="neutrino"),
-    ]
+    handles = []
+    if (encoded_labels == -1).any():
+        handles.append(plt.Line2D([0], [0], color=unknown_colour, label="unlabelled"))
+    for idx, cls in enumerate(config.semantic_classes):
+        handles.append(plt.Line2D([0], [0], color=class_colours.get(idx, "C3"), label=cls))
     fig.legend(handles=handles, loc="upper right")
     fig.suptitle(f"Blob corner projections: {npz_path.stem}")
     fig.tight_layout(rect=[0, 0, 1, 0.95])

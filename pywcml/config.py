@@ -45,7 +45,7 @@ class ConversionConfig:
     unit_ratio_threshold: float = 3.0  # if |ratio| exceeds this, rescale blob corners
     semantic_positive: int = 1  # value in ``is_nu`` treated as signal
     semantic_negative: int = 0  # fallback label when no signal points are present
-    semantic_classes: tuple[str, ...] = ("nu",)
+    semantic_classes: tuple[str, ...] = ("nu", "cosmic")
     train_fraction: float = 0.7
     val_fraction: float = 0.15
     projection_tolerance: float = 0.0  # mm tolerance between projected and observed wire coordinates
