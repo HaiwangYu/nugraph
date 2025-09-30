@@ -1,7 +1,8 @@
 """Convert WCML NPZ files into NuGraph-compatible HDF5 datasets."""
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 import warnings
 from pathlib import Path
@@ -67,12 +68,14 @@ class WCMLConverter:
             return graphs
 
         str_paths = [str(p) for p in path_list]
+        ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=worker_count,
+                                 mp_context=ctx,
                                  initializer=_init_worker,
                                  initargs=(self.config,)) as executor:
-            results: Iterable[tuple[str, NuGraphData]] = executor.map(_convert_worker, str_paths)
-            results = self._progress(results, total=len(path_list))
-            for name, data in results:
+            futures = [executor.submit(_convert_worker, path) for path in str_paths]
+            for future in self._progress(as_completed(futures), total=len(futures)):
+                name, data = future.result()
                 graphs[name] = data
         return graphs
 
