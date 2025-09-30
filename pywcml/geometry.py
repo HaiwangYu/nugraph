@@ -38,11 +38,21 @@ def estimate_unit_scale(projected: np.ndarray, observed: np.ndarray, threshold: 
 
 def triangulation_edges(points: np.ndarray) -> np.ndarray:
     """Create undirected edges from a Delaunay triangulation."""
-    if points.shape[0] < 2:
+    n_points = points.shape[0]
+    if n_points < 2:
         return np.empty((2, 0), dtype=np.int64)
     if np.allclose(points[:, :2], points[0, :2]):
         return np.empty((2, 0), dtype=np.int64)
-    triang = tri.Triangulation(points[:, 0], points[:, 1])
+    if n_points == 2:
+        return np.asarray([[0], [1]], dtype=np.int64)
+
+    try:
+        triang = tri.Triangulation(points[:, 0], points[:, 1])
+    except (ValueError, RuntimeError):
+        # fall back to a complete graph when triangulation cannot be formed
+        edges = np.array(list(combinations(range(n_points), 2)), dtype=np.int64)
+        return edges.T if edges.size else np.empty((2, 0), dtype=np.int64)
+
     edge_set = set()
     for tri_idx in triang.triangles:
         for i, j in combinations(tri_idx, 2):
