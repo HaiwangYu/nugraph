@@ -45,6 +45,7 @@ class WCMLConverter:
     def convert_many(self, paths: Sequence[Path | str]) -> Dict[str, NuGraphData]:
         graphs = {}
         for path in paths:
+            print(f"[info] converting {path}")
             name, data = self.convert(path)
             graphs[name] = data
         return graphs

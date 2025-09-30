@@ -175,4 +175,8 @@ logs
 # specific directories
 workspace
 
+# pywcml
 log
+sample
+plot_demo
+notebooks

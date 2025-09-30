@@ -20,6 +20,9 @@ def default_planes() -> Dict[str, PlaneSpec]:
         ("ctpc_f0p0", "u", radians(+60.0)),
         ("ctpc_f0p1", "v", radians(-60.0)),
         ("ctpc_f0p2", "y", radians(0.0)),
+        ("ctpc_f1p0", "u", radians(-60.0)),
+        ("ctpc_f1p1", "v", radians(+60.0)),
+        ("ctpc_f1p2", "y", radians(0.0)),
     )
     return {key: PlaneSpec(key=key, name=name, angle_rad=angle) for key, name, angle in specs}
 

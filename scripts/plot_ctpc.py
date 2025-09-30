@@ -36,8 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("source", type=Path,
                         help="Path to a WCML NPZ file or a directory containing NPZ files")
-    parser.add_argument("--outdir", type=Path, default=Path("plots_ctpc"),
-                        help="Directory where figures are written [default: %(default)s]")
+    parser.add_argument("--outdir", type=Path,
+                        help="Optional destination image path (defaults to showing the plot)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Optional cap on the number of NPZ files processed")
     parser.add_argument("--charge-log", action="store_true",
@@ -150,13 +150,19 @@ def plot_ctpc(npz_path: Path,
 
     fig.suptitle(f"{npz_path.stem}: CTPC hits")
     fig.subplots_adjust(top=0.85, right=0.94, wspace=0.25)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
 
-    dest_dir = outdir / npz_path.stem
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    out_path = dest_dir / f"{npz_path.stem}_ctpc.png"
-    fig.savefig(out_path)
-    plt.close(fig)
-    print(f"[ok] wrote {out_path}")
+    if not outdir:
+        plt.show()
+        plt.close(fig)
+        return
+    else:
+        dest_dir = outdir / npz_path.stem
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out_path = dest_dir / f"{npz_path.stem}_ctpc.png"
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"[ok] wrote {out_path}")
 
 
 def main() -> None:
