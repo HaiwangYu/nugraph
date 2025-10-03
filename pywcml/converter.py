@@ -36,6 +36,20 @@ RUN_SUBRUN_PATTERN = re.compile(r"(?P<run>\d+)_(?P<subrun>\d+)")
 _WORKER_CONVERTER = None
 
 
+def _materialize_graph(graph: NuGraphData) -> NuGraphData:
+    """Clone tensors so they no longer reference shared-memory storages."""
+    for store in graph.stores:  # type: ignore[attr-defined]
+        for key, value in list(store.items()):
+            if isinstance(value, torch.Tensor):
+                store[key] = value.detach().clone()
+    return graph
+
+try:
+    torch.multiprocessing.set_sharing_strategy("file_system")
+except (AttributeError, RuntimeError):
+    pass
+
+
 class WCMLConverter:
     """Convert WCML NPZ archives into NuGraph graphs and packaged HDF5 files."""
 
@@ -76,7 +90,7 @@ class WCMLConverter:
             futures = [executor.submit(_convert_worker, path) for path in str_paths]
             for future in self._progress(as_completed(futures), total=len(futures)):
                 name, data = future.result()
-                graphs[name] = data
+                graphs[name] = _materialize_graph(data)
         return graphs
 
     def write_hdf5(self,
@@ -442,6 +456,10 @@ class WCMLConverter:
 
 def _init_worker(config: ConversionConfig) -> None:
     global _WORKER_CONVERTER
+    try:
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except (AttributeError, RuntimeError):
+        pass
     _WORKER_CONVERTER = WCMLConverter(config)
 
 
