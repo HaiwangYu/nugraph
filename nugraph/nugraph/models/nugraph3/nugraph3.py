@@ -52,6 +52,7 @@ class NuGraph3(LightningModule):
                  instance_features: int = 8,
                  planes: tuple[str] = ("u","v","y"),
                  semantic_classes: tuple[str] = ('MIP','HIP','shower','michel','diffuse'),
+                 semantic_class_weight: list[float] | None = None,
                  event_classes: tuple[str] = ('numu','nue','nc'),
                  num_iters: int = 5,
                  event_head: bool = False,
@@ -91,8 +92,9 @@ class NuGraph3(LightningModule):
             self.decoders.append(self.event_decoder)
 
         if semantic_head:
-            self.semantic_decoder = SemanticDecoder(hit_features, semantic_classes)
+            self.semantic_decoder = SemanticDecoder(hit_features, semantic_classes, class_weight=self.hparams.semantic_class_weight)
             self.decoders.append(self.semantic_decoder)
+            
 
         if filter_head:
             self.filter_decoder = FilterDecoder(hit_features,)
