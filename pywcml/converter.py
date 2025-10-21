@@ -155,6 +155,20 @@ class WCMLConverter:
         graph["sp"].q = torch.as_tensor(charges, dtype=torch.float32)
         graph["sp"].y_semantic = torch.as_tensor(encoded_semantic, dtype=torch.long)
 
+        # ! start attempt to build 3D->3D edges
+        # Build internal superpoint (SP) edges via 2D triangulation of centroids
+        # Use x,y (first two coordinates) for triangulation; fallback to empty edges.
+        if centroids.size:
+            sp_coords_2d = centroids[:, :2]
+            sp_edges = triangulation_edges(sp_coords_2d)
+            if sp_edges.size:
+                graph["sp", "sp", "sp"].edge_index = torch.as_tensor(sp_edges, dtype=torch.long)
+            else:
+                graph["sp", "sp", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
+        else:
+            graph["sp", "sp", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
+        # ! end attempt to build 3D->3D edges
+
         for plane_name in self.config.plane_names():
             nodes = plane_nodes.get(plane_name)
             if nodes is None:
@@ -184,6 +198,7 @@ class WCMLConverter:
             else:
                 nexus_edges = torch.empty((2, 0), dtype=torch.long)
             graph[plane_name, "nexus", "sp"].edge_index = nexus_edges
+                
 
         graph["evt"].num_nodes = 1
         graph["evt"].y = torch.tensor([-1], dtype=torch.long)
