@@ -7,9 +7,9 @@ export LD_LIBRARY_PATH=/usr/lib64/mpich/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 ## WCML → NuGraph conversion
 
 ```bash
-time python scripts/wcml_to_h5.py --workers 2 pywcml/sample/2level pywcml/sample/2level.h5
-time python scripts/wcml_to_h5.py --workers 1 pywcml/sample/labeled_samples/ pywcml/sample/23334072.h5
-time python scripts/wcml_to_h5.py --workers 2 pywcml/sample/labeled_samples/ pywcml/sample/23334072.h5
+time python scripts/wcml_to_h5.py --workers 1 pywcml/sample/2level /scratch/7DayLifetime/yuhw/wirecell/nugraph/data/2level.h5
+time python scripts/wcml_to_h5.py --workers 1 pywcml/sample/labeled_samples/ /scratch/7DayLifetime/yuhw/wirecell/nugraph/data/23334072.h5
+time python scripts/wcml_to_h5.py --workers 4 pywcml/sample/labeled_samples/ /scratch/7DayLifetime/yuhw/wirecell/nugraph/data/23334072.h5
 ```
 
 Adjust `--tolerance` (drift match) and `--projection-tolerance` (wire match) if needed.
