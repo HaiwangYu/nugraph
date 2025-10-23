@@ -179,3 +179,27 @@ workspace
 log
 sample
 plot_demo
+
+# --- Local environment & cache ---
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# --- Logs ---
+lightning_logs/
+*.log
+wandb/
+
+# --- Test/Submission Scripts ---
+*.pbs
+*smoke.py
+preflight_h5.py
+check_mpi_env.py
+minimal_ddp_test.py
+mpi_hello.py
+set_affinity_gpu_polaris.sh
+
+# --- Old versions ---
+*_OG.py
+worker_train.sh
+

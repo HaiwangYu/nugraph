@@ -1,6 +1,7 @@
 """NuGraph3 model architecture"""
 import argparse
 import warnings
+import os
 
 import torch.cuda
 from torch.optim import AdamW
@@ -17,9 +18,19 @@ from .decoders import (SemanticDecoder, FilterDecoder, EventDecoder, VertexDecod
 
 from ...data import H5DataModule
 
-if torch.cuda.is_available():
-    from rmm.allocators.torch import rmm_torch_allocator
-    torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
+# if torch.cuda.is_available():
+#     from rmm.allocators.torch import rmm_torch_allocator
+#     torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
+
+ # Optional RMM (RAPIDS) allocator: enable only if requested AND available
+_use_rmm_env = os.environ.get("NUGRAPH_USE_RMM", "0").lower() in ("1","true","yes","y")
+if torch.cuda.is_available() and _use_rmm_env:
+    try:
+        from rmm.allocators.torch import rmm_torch_allocator  # type: ignore
+        torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
+        print("[nugraph] Using RMM CUDA allocator.")
+    except Exception as _e:
+        print(f"[nugraph] RMM not available ({_e}); using default CUDA allocator.")
 
 class NuGraph3(LightningModule):
     """
