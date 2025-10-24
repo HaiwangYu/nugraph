@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #PBS -N Nugraph_DDP_AWS_OFI
-#PBS -l select=8:ncpus=32:ngpus=4:mem=128gb
+#PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
 #PBS -l walltime=01:00:00
 #PBS -q debug-scaling
 #PBS -A neutrinoGPU::debug
@@ -49,8 +49,8 @@ export NCCL_OFI_LOG_LEVEL=INFO
 
 # Loud & clear failures / sync kernels
 export PYTHONFAULTHANDLER=1
-export CUDA_LAUNCH_BLOCKING=1
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
+# export CUDA_LAUNCH_BLOCKING=1
+# export TORCH_DISTRIBUTED_DEBUG=DETAIL
 
 # Optional: avoid WANDB network during debugging
 # export WANDB_MODE=offline
@@ -137,7 +137,18 @@ echo "PYTHONPATH=${PYTHONPATH:-}"
 
 # --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="polaris-ddp-8gpu-nugraph-a-smoke"
+RUN_NAME="nug3_n16_hf256_nf32_it5_lr1e-4_nw0_scw25"
+
+# --- DEFINE THE CHECKPOINT PATH ---
+CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
+echo "Attempting to resume training from: ${CKPT_PATH}"
+
+
+# Check if the checkpoint file actually exists before trying to resume
+if [ ! -f "${CKPT_PATH}" ]; then
+    echo "WARNING: Checkpoint file not found at ${CKPT_PATH}. Starting a new run."
+    CKPT_PATH="" # <-- SET TO AN EMPTY STRING, NOT "None"
+fi
 
 mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
   python -u ./train.py \
@@ -146,4 +157,11 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --run-name "${RUN_NAME}" \
     --num-workers 0 \
     --gpus-per-node "${GPUS_PER_NODE}" \
-    --learning-rate 2e-5
+    --learning-rate 1e-4 \
+    --hit-features 256 \
+    --semantic-class-weight 25.0 1.0 \
+    --num-iters 5 \
+    --nexus-features 32 \
+    --interaction-features 32 \
+    --in-features 8 \
+    ${CKPT_PATH:+--resume-from "$CKPT_PATH"}

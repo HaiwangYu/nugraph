@@ -100,7 +100,7 @@ def main(args):
 
     # Add print statement to verify num_workers
     print(f"[Rank {global_rank}] Initializing DataModule with num_workers = {args.num_workers}")
-    nudata = DataModule(model=Model, data_path=args.data_path, num_workers=args.num_workers)
+    nudata = DataModule(model=Model, data_path=args.data_path, num_workers=args.num_workers, batch_size=args.batch_size)
 
     # Make dataloading conservative for multi-node HDF5
     for attr, val in [
@@ -175,7 +175,7 @@ def main(args):
                                      patience=15, min_delta=1e-4, verbose=(global_rank==0)),
         pl.callbacks.LearningRateMonitor(logging_interval="step"),
         pl.callbacks.ModelCheckpoint(monitor="semantic/f1-macro-val", mode="max", save_top_k=1,
-                                     filename="best-f1", dirpath=ckpt_dir),
+                                     filename="best-f1", dirpath=ckpt_dir, save_last=True),
         pl.callbacks.ModelCheckpoint(monitor="semantic/recall-macro-val", mode="max", save_top_k=1,
                                      filename="best-recall", dirpath=ckpt_dir),
     ]
@@ -222,7 +222,15 @@ def main(args):
     print(f"[Rank {global_rank}] Starting training...")
     # Setup datamodule before fit (good practice, maybe redundant if setup already called)
     # trainer.datamodule = nudata
-    trainer.fit(nugraph, datamodule=nudata)
+    ckpt_path = args.resume_from
+    if ckpt_path:
+        print(f"[Rank {global_rank}] Resuming training from checkpoint: {ckpt_path}")
+        trainer.fit(nugraph, datamodule=nudata, ckpt_path=ckpt_path)
+    
+    else:
+        # Start a new run without the ckpt_path argument
+        print(f"[Rank {global_rank}] Starting a new training run (no checkpoint specified).")
+        trainer.fit(nugraph, datamodule=nudata)
 
     # --- Testing (run on ALL ranks) ---
     # Remove the `if global_rank == 0:` guard around testing.
@@ -255,6 +263,7 @@ if __name__ == "__main__":
     # --- Hardware & Dataloading ---
     p.add_argument("--gpus-per-node", type=int, default=4, help="Number of GPUs per node (Polaris=4).")
     p.add_argument("--num-workers", type=int, default=2, help="DataLoader workers per rank (0 often safest for HDF5).")
+    p.add_argument("--batch-size", type=int, default=32, help="Batch size per GPU (per rank).")
 
     # --- Training Hyperparameters ---
     p.add_argument("--learning-rate", type=float, default=2e-5)
@@ -280,6 +289,6 @@ if __name__ == "__main__":
     # --- Other ---
     p.add_argument("--use-checkpointing", dest="use_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing (default).")
     p.add_argument("--no-checkpointing", dest="use_checkpointing", action="store_false", help="Disable gradient checkpointing.")
-
+    p.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint file to resume training from (e.g., .../last.ckpt)")
     args = p.parse_args()
     main(args)
