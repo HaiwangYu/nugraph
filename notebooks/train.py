@@ -172,7 +172,7 @@ def main(args):
     # Define ALL callbacks on ALL ranks
     callbacks = [
         pl.callbacks.EarlyStopping(monitor="semantic/f1-macro-val", mode="max",
-                                     patience=15, min_delta=1e-4, verbose=(global_rank==0)),
+                                     patience=20, min_delta=1e-4, verbose=(global_rank==0)),
         pl.callbacks.LearningRateMonitor(logging_interval="step"),
         pl.callbacks.ModelCheckpoint(monitor="semantic/f1-macro-val", mode="max", save_top_k=1,
                                      filename="best-f1", dirpath=ckpt_dir, save_last=True),

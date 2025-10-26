@@ -1,7 +1,7 @@
 #!/bin/bash -l
 #PBS -N Nugraph_DDP_AWS_OFI
 #PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
-#PBS -l walltime=01:00:00
+#PBS -l walltime=1:00:00
 #PBS -q debug-scaling
 #PBS -A neutrinoGPU::debug
 #PBS -l filesystems=home:grand:eagle
@@ -137,7 +137,7 @@ echo "PYTHONPATH=${PYTHONPATH:-}"
 
 # --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="nug3_n16_hf256_nf32_it5_lr1e-4_nw0_scw25"
+RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw7"
 
 # --- DEFINE THE CHECKPOINT PATH ---
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
@@ -155,13 +155,14 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --data-path "${DATA}" \
     --log-dir "${LOGDIR}" \
     --run-name "${RUN_NAME}" \
+    --max-epochs 80 \
     --num-workers 0 \
     --gpus-per-node "${GPUS_PER_NODE}" \
     --learning-rate 1e-4 \
     --hit-features 256 \
-    --semantic-class-weight 25.0 1.0 \
-    --num-iters 5 \
-    --nexus-features 32 \
+    --semantic-class-weight 7.0 1.0 \
+    --num-iters 7 \
+    --nexus-features 64 \
     --interaction-features 32 \
     --in-features 8 \
     ${CKPT_PATH:+--resume-from "$CKPT_PATH"}

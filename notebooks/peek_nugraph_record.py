@@ -9,7 +9,7 @@ This script:
   4) (Optional) Exports that single event to NPZ for quick experiments
 
 Example:
-  python peek_nugraph_record.py /scratch/7DayLifetime/yuhw/wirecell/nugraph/data/23334072.h5
+  python peek_nugraph_record.py /lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072.h5     
   python peek_nugraph_record.py /scratch/.../23334072.h5 --key dataset/23334072_113_rec-lab-apa1-4
   python peek_nugraph_record.py /scratch/.../23334072.h5 --export foo_event.npz
 """

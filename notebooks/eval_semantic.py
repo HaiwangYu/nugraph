@@ -23,7 +23,10 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=None)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--nu-thr", type=float, default=None,
-                   help="Decision threshold for p(nu). If unset, pick best-F1 on validation data.")
+                   help="Decision threshold for p(nu). If set, we use this value directly.")
+    p.add_argument("--beta", type=float, default=None,
+                   help="If provided, choose threshold that maximizes Fβ on the chosen split "
+                        "(β<1 favors precision; β>1 favors recall). If omitted, uses best-F1.")
     return p.parse_args()
 
 
@@ -77,7 +80,6 @@ def collect_split(nugraph, loader, device, limit=None, expected_width=None):
     nugraph.eval().to(device)
     y_true, y_pred, y_score = [], [], []
 
-    # Use a progress bar for long evaluations
     from tqdm import tqdm
     print("Collecting predictions from the model...")
     for i, b in enumerate(tqdm(loader)):
@@ -85,15 +87,12 @@ def collect_split(nugraph, loader, device, limit=None, expected_width=None):
             break
         b = b.to(device)
 
-        # Make sure features exist before forward
         require_hit_x_or_die(b, expected_width=expected_width)
 
-        # Forward (decoder writes softmax probs to b["hit"].x_semantic)
         _loss, _ = nugraph(b, stage="test")
         p = b["hit"].x_semantic.detach()      # [N, C], probs
         y = b["hit"].y_semantic.detach()
 
-        # Keep only labeled
         mask = y >= 0
         if mask.sum() == 0:
             continue
@@ -130,9 +129,8 @@ def report_thresholded(y_true, y_score, nu_thr, header):
     """
     Apply threshold on p(nu). If p(nu) >= nu_thr => predict nu(0), else cosmic(1).
     """
-    y_bin = (y_true == 0).astype(int)  # 1 means "nu-positive" for PR-style thinking
+    y_bin = (y_true == 0).astype(int)  # 1 means "nu-positive"
     y_pred_thr_bin = (y_score >= nu_thr).astype(int)
-    # Map back to original label ids: 1->nu(0), 0->cosmic(1)
     y_pred_thr = np.where(y_pred_thr_bin == 1, 0, 1)
 
     print(f"\n{header}")
@@ -150,19 +148,33 @@ def pick_best_f1_threshold(y_true, y_score):
     """
     y_bin = (y_true == 0).astype(int)
     prec, rec, thr = precision_recall_curve(y_bin, y_score)
-    # Add a small epsilon to avoid division by zero
     f1 = 2 * prec * rec / (prec + rec + 1e-12)
-    # Find the index of the maximum F1 score
-    idx = np.nanargmax(f1[:-1]) # Exclude the last value which can be problematic
+    idx = np.nanargmax(f1[:-1])  # exclude last sentinel
     best_thr = thr[idx] if idx < len(thr) else 0.5
-    return best_thr, prec[idx], rec[idx]
+    return best_thr, float(prec[idx]), float(rec[idx])
 
-def plot_pr_curve(y_true, y_score, filename):
+
+def pick_best_fbeta_threshold(y_true, y_score, beta=0.5):
     """
-    Calculate and plot the precision-recall curve for the 'nu' class.
+    Compute PR curve and return threshold that maximizes Fβ.
+    β < 1 favors precision; β > 1 favors recall.
+    """
+    y_bin = (y_true == 0).astype(int)
+    prec, rec, thr = precision_recall_curve(y_bin, y_score)
+    beta2 = beta * beta
+    fbeta = (1 + beta2) * prec * rec / (beta2 * prec + rec + 1e-12)
+    idx = np.nanargmax(fbeta[:-1])  # exclude last sentinel
+    best_thr = thr[idx] if idx < len(thr) else 0.5
+    return best_thr, float(prec[idx]), float(rec[idx])
+
+
+def plot_pr_curve(y_true, y_score, filename, beta=None):
+    """
+    Plot the precision-recall curve for the 'nu' class.
+    Marks best-F1, and best-Fβ if beta is provided.
     """
     print(f"\nGenerating Precision-Recall curve for '{filename}'...")
-    y_bin = (y_true == 0).astype(int)  # Treat 'nu' (class 0) as the positive class
+    y_bin = (y_true == 0).astype(int)
     precision, recall, _ = precision_recall_curve(y_bin, y_score)
 
     plt.figure(figsize=(8, 6), dpi=150)
@@ -173,12 +185,17 @@ def plot_pr_curve(y_true, y_score, filename):
     plt.grid(True)
     plt.xlim([0, 1.02])
     plt.ylim([0, 1.02])
-    
-    # Find and plot the best F1-score point
-    best_thr, p, r = pick_best_f1_threshold(y_true, y_score)
-    plt.plot(r, p, 'ro', markersize=8, label=f'Best F1-Score (thr={best_thr:.3f})\nPrecision={p:.2f}, Recall={r:.2f}')
+
+    # Best F1
+    f1_thr, p1, r1 = pick_best_f1_threshold(y_true, y_score)
+    plt.plot(r1, p1, 'ro', markersize=7, label=f'Best F1 (thr={f1_thr:.3f})\nP={p1:.2f}, R={r1:.2f}')
+
+    # Best Fβ (optional)
+    if beta is not None:
+        fbeta_thr, pb, rb = pick_best_fbeta_threshold(y_true, y_score, beta=beta)
+        plt.plot(rb, pb, 'gs', markersize=7, label=f'Best F{beta:.2f} (thr={fbeta_thr:.3f})\nP={pb:.2f}, R={rb:.2f}')
+
     plt.legend()
-    
     plt.savefig(filename)
     print(f"--> Saved plot to {filename}")
 
@@ -219,21 +236,28 @@ def main():
     report_argmax(y_true, y_pred, y_score, args.split.upper())
 
     # 2) Thresholded evaluation
+    chosen_thr = None
     if args.nu_thr is not None:
-        # User-specified threshold
-        report_thresholded(y_true, y_score, args.nu_thr,
-                           header=f"[{args.split.upper()}] THRESHOLDED (user)")
+        chosen_thr = args.nu_thr
+        header = f"[{args.split.upper()}] THRESHOLDED (user)"
+        report_thresholded(y_true, y_score, chosen_thr, header=header)
     else:
-        # Auto-pick best-F1 threshold
-        best_thr, p, r = pick_best_f1_threshold(y_true, y_score)
-        print(f"\nBest-F1 ν-threshold found: {best_thr:.3f} "
-              f"(precision={p:.3f}, recall={r:.3f})")
-        report_thresholded(y_true, y_score, best_thr,
-                           header=f"[{args.split.upper()}] THRESHOLDED (best-F1)")
+        if args.beta is not None:
+            chosen_thr, p, r = pick_best_fbeta_threshold(y_true, y_score, beta=args.beta)
+            print(f"\nBest-F{args.beta:.2f} ν-threshold found: {chosen_thr:.3f} "
+                  f"(precision={p:.3f}, recall={r:.3f})")
+            header = f"[{args.split.upper()}] THRESHOLDED (best-F{args.beta:.2f})"
+        else:
+            chosen_thr, p, r = pick_best_f1_threshold(y_true, y_score)
+            print(f"\nBest-F1 ν-threshold found: {chosen_thr:.3f} "
+                  f"(precision={p:.3f}, recall={r:.3f})")
+            header = f"[{args.split.upper()}] THRESHOLDED (best-F1)"
 
-    # 3) Plot and save the PR curve
+        report_thresholded(y_true, y_score, chosen_thr, header=header)
+
+    # 3) Plot and save the PR curve (marks best-F1; also best-Fβ if provided)
     plot_filename = os.path.basename(args.ckpt).replace(".ckpt", "_pr_curve.png")
-    plot_pr_curve(y_true, y_score, plot_filename)
+    plot_pr_curve(y_true, y_score, plot_filename, beta=args.beta)
 
 
 if __name__ == "__main__":
