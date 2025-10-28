@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import glob
 from pathlib import Path
 
 from . import ConversionConfig, WCMLConverter
@@ -11,8 +12,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "source",
-        type=Path,
-        help="Path to a WCML NPZ file or a directory containing NPZ files",
+        nargs="+",
+        type=str,
+        help="One or more paths/patterns (files, directories or globs like '23334072_1*')",
     )
     parser.add_argument(
         "output",
@@ -61,15 +63,23 @@ def main(argv: list[str] | None = None) -> None:
         val_fraction=args.val_frac,
     )
     converter = WCMLConverter(config)
-    if args.source.is_dir():
-        paths = _collect_npz_files(args.source)
-        if not paths:
-            raise SystemExit(f"no NPZ files found under {args.source}")
-        graphs = converter.convert_many(paths, workers=args.workers)
-        converter.write_hdf5(graphs, args.output)
-    else:
-        name, graph = converter.convert(args.source)
-        converter.write_hdf5({name: graph}, args.output)
+    # Expand multiple source patterns and collect npz files
+    src_patterns = args.source  # list[str]
+    npz_paths: list[Path] = []
+    for pattern in src_patterns:
+        matches = [Path(p) for p in glob.glob(pattern)]
+        # If nothing matched glob, treat the literal as a path
+        if not matches:
+            matches = [Path(pattern)]
+        for m in matches:
+            if m.is_dir():
+                npz_paths.extend(_collect_npz_files(m))
+            elif m.is_file() and m.suffix == ".npz":
+                npz_paths.append(m)
+    if not npz_paths:
+        raise SystemExit(f"no NPZ files found for patterns: {src_patterns}")
+    graphs = converter.convert_many(npz_paths, workers=args.workers)
+    converter.write_hdf5(graphs, args.output)
 
 
 if __name__ == "__main__":  # pragma: no cover
