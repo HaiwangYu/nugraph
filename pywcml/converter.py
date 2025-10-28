@@ -169,19 +169,31 @@ class WCMLConverter:
         graph["sp"].q = torch.as_tensor(charges, dtype=torch.float32)
         graph["sp"].y_semantic = torch.as_tensor(encoded_semantic, dtype=torch.long)
 
-        # ! start attempt to build 3D->3D edges
-        # Build internal superpoint (SP) edges via 2D triangulation of centroids
-        # Use x,y (first two coordinates) for triangulation; fallback to empty edges.
+        # Build internal superpoint (SP) edges.
+        # Prefer PyG Delaunay (can operate on full 3D pos); fall back to 2D triangulation.
         if centroids.size:
-            sp_coords_2d = centroids[:, :2]
-            sp_edges = triangulation_edges(sp_coords_2d)
-            if sp_edges.size:
-                graph["sp", "sp", "sp"].edge_index = torch.as_tensor(sp_edges, dtype=torch.long)
-            else:
-                graph["sp", "sp", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
+            try:
+                # Import locally to avoid hard dependency at module import time.
+                from torch_geometric.data import Data as PyGData  # type: ignore
+                from torch_geometric.transforms import Delaunay  # type: ignore
+
+                pos = torch.as_tensor(centroids, dtype=torch.float32)
+                data = PyGData(pos=pos)
+                data = Delaunay()(data)  # may populate data.edge_index
+                sp_edges = getattr(data, "edge_index", None)
+                if sp_edges is None or sp_edges.numel() == 0:
+                    raise RuntimeError("Delaunay produced no edges")
+                graph["sp", "nexus", "sp"].edge_index = sp_edges.to(torch.long)
+            except Exception:
+                # Fallback: use existing 2D triangulation on XY plane
+                sp_coords_2d = centroids[:, :2]
+                sp_edges = triangulation_edges(sp_coords_2d)
+                if sp_edges.size:
+                    graph["sp", "nexus", "sp"].edge_index = torch.as_tensor(sp_edges, dtype=torch.long)
+                else:
+                    graph["sp", "nexus", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
         else:
-            graph["sp", "sp", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
-        # ! end attempt to build 3D->3D edges
+            graph["sp", "nexus", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
 
         for plane_name in self.config.plane_names():
             nodes = plane_nodes.get(plane_name)
