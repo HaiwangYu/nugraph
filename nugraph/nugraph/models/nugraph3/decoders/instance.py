@@ -151,7 +151,7 @@ class InstanceDecoder(nn.Module):
         arr = ox[mask].detach()
         if not arr.is_cuda:
             arr = arr.numpy()
-        i[mask] = torch.as_tensor(self.dbscan.fit_predict(arr), dtype=torch.long)
+        i[mask] = torch.as_tensor(self.dbscan.fit_predict(arr), dtype=torch.long,device=ox.device)
         x_ip = torch.empty(i.max()+1, 0, dtype=torch.float, device=ox.device)
         mask = i > -1
         e_h_ip = torch.stack((torch.nonzero(mask).squeeze(1), i[mask])).long()
