@@ -169,29 +169,9 @@ class WCMLConverter:
         graph["sp"].q = torch.as_tensor(charges, dtype=torch.float32)
         graph["sp"].y_semantic = torch.as_tensor(encoded_semantic, dtype=torch.long)
 
-        # Build internal superpoint (SP) edges.
-        # Prefer PyG Delaunay (can operate on full 3D pos); fall back to 2D triangulation.
-        if centroids.size:
-            try:
-                # Import locally to avoid hard dependency at module import time.
-                from torch_geometric.data import Data as PyGData  # type: ignore
-                from torch_geometric.transforms import Delaunay  # type: ignore
-
-                pos = torch.as_tensor(centroids, dtype=torch.float32)
-                data = PyGData(pos=pos)
-                data = Delaunay()(data)  # may populate data.edge_index
-                sp_edges = getattr(data, "edge_index", None)
-                if sp_edges is None or sp_edges.numel() == 0:
-                    raise RuntimeError("Delaunay produced no edges")
-                graph["sp", "nexus", "sp"].edge_index = sp_edges.to(torch.long)
-            except Exception:
-                # Fallback: use existing 2D triangulation on XY plane
-                sp_coords_2d = centroids[:, :2]
-                sp_edges = triangulation_edges(sp_coords_2d)
-                if sp_edges.size:
-                    graph["sp", "nexus", "sp"].edge_index = torch.as_tensor(sp_edges, dtype=torch.long)
-                else:
-                    graph["sp", "nexus", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
+        blob_pairs, blob_edges = self._ppedges_to_blobedges(arrays.ppedges,arrays.points)
+        if blob_edges.size:
+            graph["sp", "nexus", "sp"].edge_index = torch.as_tensor(blob_edges,dtype=torch.long)
         else:
             graph["sp", "nexus", "sp"].edge_index = torch.empty((2, 0), dtype=torch.long)
 
@@ -262,6 +242,57 @@ class WCMLConverter:
             blob_labels = is_nu[mask]
             labels[blob_id] = config.semantic_positive if (blob_labels == config.semantic_positive).any() else config.semantic_negative
         return labels
+    
+    def _ppedges_to_blobedges(self, ppedges: np.ndarray, points: np.ndarray):
+        """
+        Convert point-level edges -> unique blob-level edges.
+        Assumes that the input/output edges are undirected.
+
+        Args:
+            ppedges: (M, >=2) array of [head_point_idx, tail_point_idx, ...]
+            points: (P, >=5) array where points[:,4] is int blob index (>=0) or -1 for none
+
+        Returns:
+            blob_pairs: (K,2) int64 array of unique blob index pairs (head, tail)
+            edge_index: (2,E) int64 array suitable for PyG (contains both directions if undirected=True)
+        """
+        import numpy as np
+
+        heads = ppedges[:, 0].astype(np.int64)
+        tails = ppedges[:, 1].astype(np.int64)
+        blob_idx = points[:, 4].astype(np.int64)
+
+        bh = blob_idx[heads]
+        bt = blob_idx[tails]
+
+        # keep only edges where both endpoints have a blob
+        # all points SHOULD have a blob... but sanity check 
+        mask = (bh >= 0) & (bt >= 0)
+        if not np.any(mask):
+            return np.empty((0, 2), dtype=np.int64), np.empty((2, 0), dtype=np.int64)
+        bh = bh[mask]; bt = bt[mask]
+
+        # drop any where the head/tail is the same blob 
+        keep = bh != bt
+        if not np.any(keep):
+            return np.empty((0, 2), dtype=np.int64), np.empty((2, 0), dtype=np.int64)
+        bh = bh[keep]; bt = bt[keep]
+
+        a = np.minimum(bh, bt)
+        b = np.maximum(bh, bt)
+        pairs = np.stack([a, b], axis=1)
+
+        # deduplicate rows
+        pairs_unique = np.unique(pairs, axis=0).astype(np.int64)
+
+        # build PyG-style edge_index
+        if pairs_unique.size == 0:
+            return pairs_unique, np.empty((2, 0), dtype=np.int64)
+
+        src = pairs_unique[:, 0]
+        dst = pairs_unique[:, 1]
+        edge_index = np.stack([src, dst], axis=0)
+        return pairs_unique, edge_index
 
     def _encode_semantic_labels(self, labels: np.ndarray) -> np.ndarray:
         """Map raw semantic values to class indices used downstream."""
