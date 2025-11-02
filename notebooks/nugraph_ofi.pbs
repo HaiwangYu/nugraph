@@ -64,7 +64,7 @@ export MASTER_ADDR="$(head -n1 "${PBS_NODEFILE}")"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
 # --- Dataset path; export so --envall propagates ---
-export DATA="/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072.h5"
+export DATA="/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d.h5"
 ls -lh "$DATA" || { echo "DATA file missing"; exit 1; }
 
 NODES="${PBS_NNODES:-2}"
@@ -137,7 +137,7 @@ echo "PYTHONPATH=${PYTHONPATH:-}"
 
 # --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw7"
+RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw10_3d"
 
 # --- DEFINE THE CHECKPOINT PATH ---
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
@@ -160,7 +160,7 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --gpus-per-node "${GPUS_PER_NODE}" \
     --learning-rate 1e-4 \
     --hit-features 256 \
-    --semantic-class-weight 7.0 1.0 \
+    --semantic-class-weight 10.0 1.0 \
     --num-iters 7 \
     --nexus-features 64 \
     --interaction-features 32 \

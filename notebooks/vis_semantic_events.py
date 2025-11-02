@@ -38,10 +38,12 @@ def parse_args():
                    help="If set (and --nu-thr not set), choose threshold that maximizes Fβ.")
 
     # Coordinates
-    p.add_argument("--x-col", type=int, default=None,
-                   help="Column index in hit.x to use for X if no pos/xy is available")
-    p.add_argument("--y-col", type=int, default=None,
-                   help="Column index in hit.x to use for Y if no pos/xy is available")
+    p.add_argument("--x-col", type=int, default=0, # Default to 0, usually wire
+                   help="Column index in hit.pos (or hit.x) to use for X-axis (wire).")
+    p.add_argument("--y-col", type=int, default=1, # Default to 1, usually time
+                   help="Column index in hit.pos (or hit.x) to use for Y-axis (time).")
+    p.add_argument("--plane-col", type=int, default=7, # <--- NEW ARGUMENT for plane ID
+                   help="Column index in hit.x (features) that stores the plane ID (0=U, 1=V, 2=Y).")
 
     # Plotting
     p.add_argument("--point-size", type=float, default=2.0)
@@ -72,26 +74,32 @@ def make_datamodule(ng, data_path, model_cls):
     return dm
 
 
-def get_hit_xy(hit_store, x_col=None, y_col=None):
+def get_hit_xy(hit_store, x_col=0, y_col=1): # Changed defaults to 0 and 1 here
     # Try pos
     if hasattr(hit_store, "pos") and hit_store.pos is not None:
         pos = hit_store.pos
         if pos.dim() == 2 and pos.size(-1) >= 2:
-            xy = pos[:, :2]
+            # Assuming x_col/y_col refer to indices within pos (e.g., pos[:, 0] and pos[:, 1])
+            xy = pos[:, [x_col, y_col]]
             return xy[:, 0].detach().cpu().numpy(), xy[:, 1].detach().cpu().numpy()
     # Try xy
     if hasattr(hit_store, "xy") and hit_store.xy is not None:
         xy = hit_store.xy
         if xy.dim() == 2 and xy.size(-1) >= 2:
-            return xy[:, 0].detach().cpu().numpy(), xy[:, 1].detach().cpu().numpy()
-    # Fallback to features
+            # Assuming x_col/y_col refer to indices within xy
+            xy_chosen = xy[:, [x_col, y_col]]
+            return xy_chosen[:, 0].detach().cpu().numpy(), xy_chosen[:, 1].detach().cpu().numpy()
+    # Fallback to features (hit.x)
     if not hasattr(hit_store, "x") or hit_store.x is None:
-        raise RuntimeError("No hit.pos/xy and hit.x missing—need --x-col/--y-col.")
-    if x_col is None or y_col is None:
-        raise RuntimeError("No hit.pos/xy—please pass --x-col and --y-col.")
-    x = hit_store.x[:, x_col]
-    y = hit_store.x[:, y_col]
-    return x.detach().cpu().numpy(), y.detach().cpu().numpy()
+        raise RuntimeError("No hit.pos/xy and hit.x missing—cannot get coordinates.")
+    
+    # If using hit.x as the source for coordinates, ensure x_col/y_col are valid indices for hit.x
+    if hit_store.x.size(-1) <= max(x_col, y_col):
+        raise RuntimeError(f"x_col ({x_col}) or y_col ({y_col}) out of bounds for hit.x (size {hit_store.x.size(-1)}).")
+    
+    x_coord = hit_store.x[:, x_col]
+    y_coord = hit_store.x[:, y_col]
+    return x_coord.detach().cpu().numpy(), y_coord.detach().cpu().numpy()
 
 
 @torch.no_grad()
@@ -177,6 +185,11 @@ def main():
             log(f"[debug] has pos? {hasattr(batch['hit'],'pos')}  has xy? {hasattr(batch['hit'],'xy')}")
             if hasattr(batch['hit'], 'x'):
                 log(f"[debug] hit.x shape: {tuple(batch['hit'].x.shape)}")
+                # Check the plane column if specified
+                if args.plane_col is not None and args.plane_col < batch['hit'].x.size(-1):
+                    log(f"[debug] hit.x[:, {args.plane_col}] unique values: "
+                        f"{torch.unique(batch['hit'].x[:, args.plane_col]).detach().cpu().numpy()}")
+
 
         _loss, _metrics = nugraph(batch, stage="test")
         probs = batch["hit"].x_semantic.detach()  # [N, 2]
@@ -184,10 +197,20 @@ def main():
 
         # Coordinates for the whole batch
         try:
+            # Pass x_col and y_col arguments to get_hit_xy
             Xall, Yall = get_hit_xy(batch["hit"], x_col=args.x_col, y_col=args.y_col)
         except Exception as e:
             (outdir / "_ERROR.txt").write_text(f"Coordinate extraction failed:\n{e}\n")
             raise
+            
+        # --- NEW: Get Plane attribute from hit.x ---
+        Planeall = None
+        if hasattr(batch["hit"], "x") and args.plane_col is not None and args.plane_col < batch["hit"].x.size(-1):
+             Planeall = batch["hit"].x[:, args.plane_col].detach().cpu().numpy()
+        else:
+             log(f"[warn] Cannot extract plane IDs. 'hit.x' missing, or --plane-col ({args.plane_col}) "
+                 f"is out of bounds for hit.x (size {batch['hit'].x.size(-1) if hasattr(batch['hit'], 'x') else 'N/A'}).")
+        # --- END NEW ---
 
         if not hasattr(batch["hit"], "ptr") or batch["hit"].ptr is None:
             raise RuntimeError("batch['hit'].ptr missing, cannot slice per event.")
@@ -207,6 +230,11 @@ def main():
 
             x = Xall[idx]
             y = Yall[idx]
+            
+            # --- Per-event plane indices ---
+            plane_indices = Planeall[idx] if Planeall is not None else None 
+            # --- End per-event ---
+
             y_true = labels[idx].detach().long().cpu().numpy()
             p_nu = probs[idx][:, 0].detach().cpu().numpy()
             y_pred = np.where(p_nu >= nu_thr, 0, 1)  # 0=nu, 1=cosmic
@@ -219,19 +247,52 @@ def main():
 
             fig, axes = plt.subplots(1, 2, figsize=(9, 4), dpi=args.dpi, constrained_layout=True)
             axL, axR = axes
+            
+            # --- NEW: Draw Plane Boundaries ---
+            if plane_indices is not None:
+                # Get min/max wire (x) for each plane based on the current event's hits
+                # Assuming plane IDs 0, 1, 2 for U, V, Y respectively
+                
+                # Filter out planes that might not be present in this specific event or are invalid
+                unique_planes_in_event = np.sort(np.unique(plane_indices))
+                
+                # We need at least two planes to define a boundary between them
+                if len(unique_planes_in_event) > 1:
+                    plane_x_coords = {}
+                    for p_id in unique_planes_in_event:
+                        mask = plane_indices == p_id
+                        if np.any(mask): # Check if there are hits for this plane
+                            plane_x_coords[p_id] = x[mask]
+                    
+                    # Calculate boundaries between adjacent planes that are present
+                    boundaries = []
+                    for i in range(len(unique_planes_in_event) - 1):
+                        p1_id = unique_planes_in_event[i]
+                        p2_id = unique_planes_in_event[i+1]
+                        
+                        if p1_id in plane_x_coords and p2_id in plane_x_coords:
+                            # Calculate midpoint of the gap
+                            boundary_val = (np.max(plane_x_coords[p1_id]) + np.min(plane_x_coords[p2_id])) / 2.0
+                            boundaries.append(boundary_val)
+                            
+                    # Draw the lines on both axes
+                    for ax in axes:
+                        for boundary in boundaries:
+                            ax.axvline(boundary, color='white', linestyle='--', linewidth=1.5, alpha=0.7)
+            # --- End Boundary ---
 
             # Truth
             axL.scatter(x[m][y_true[m] == 0], y[m][y_true[m] == 0], s=args.point_size, alpha=0.85, label="ν (truth)")
             axL.scatter(x[m][y_true[m] == 1], y[m][y_true[m] == 1], s=args.point_size, alpha=0.85, label="cosmic (truth)")
             axL.set_title("Truth")
-            axL.set_xlabel("X"); axL.set_ylabel("Y")
+            axL.set_xlabel("X (Wire)"); axL.set_ylabel("Y (Time)")
             axL.legend(markerscale=3, loc="best")
 
             # Prediction
             axR.scatter(x[y_pred == 0], y[y_pred == 0], s=args.point_size, alpha=0.85, label=f"ν (pred, thr={nu_thr:.3f})")
             axR.scatter(x[y_pred == 1], y[y_pred == 1], s=args.point_size, alpha=0.85, label="cosmic (pred)")
             axR.set_title("Prediction")
-            axR.set_xlabel("X"); axR.set_ylabel("Y")
+            axR.set_xlabel("X (Wire)"); axR.set_ylabel("Y (Time)")
             axR.legend(markerscale=3, loc="best")
 
             n_nu_true = int((y_true == 0).sum())

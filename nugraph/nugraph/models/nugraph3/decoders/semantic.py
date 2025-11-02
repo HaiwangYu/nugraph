@@ -280,4 +280,3 @@ class SemanticDecoder(nn.Module):
         # keep your existing PNG logging (if ConfusionMatrixLogger writes artifacts),
         # and ALSO push nice images directly to W&B:
         self._log_confusions(logger, stage, epoch)
-
