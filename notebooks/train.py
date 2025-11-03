@@ -145,6 +145,7 @@ def main(args):
         instance_head=args.instance_head,
         use_checkpointing=args.use_checkpointing,
         lr=args.learning_rate,
+        dropedge_sp=args.dropedge_sp,
     )
     # Ensure FP32 params
     for p in nugraph.parameters():
@@ -290,5 +291,7 @@ if __name__ == "__main__":
     p.add_argument("--use-checkpointing", dest="use_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing (default).")
     p.add_argument("--no-checkpointing", dest="use_checkpointing", action="store_false", help="Disable gradient checkpointing.")
     p.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint file to resume training from (e.g., .../last.ckpt)")
+    p.add_argument("--dropedge-sp", type=float, default=0.0,
+                   help="DropEdge probability for pp-edges (sp—nexus—sp). 0.05 recommended for Run A.")
     args = p.parse_args()
     main(args)

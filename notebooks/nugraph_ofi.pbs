@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#PBS -N Nugraph_DDP_AWS_OFI
+#PBS -N Nugraph_DDP
 #PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
 #PBS -l walltime=1:00:00
 #PBS -q debug-scaling
@@ -64,7 +64,7 @@ export MASTER_ADDR="$(head -n1 "${PBS_NODEFILE}")"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
 # --- Dataset path; export so --envall propagates ---
-export DATA="/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d.h5"
+export DATA="/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d_ppedges.h5"
 ls -lh "$DATA" || { echo "DATA file missing"; exit 1; }
 
 NODES="${PBS_NNODES:-2}"
@@ -137,7 +137,7 @@ echo "PYTHONPATH=${PYTHONPATH:-}"
 
 # --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw10_3d"
+RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw10_ppedges_aw_dropedge005"
 
 # --- DEFINE THE CHECKPOINT PATH ---
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
@@ -165,4 +165,5 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --nexus-features 64 \
     --interaction-features 32 \
     --in-features 8 \
+    --dropedge-sp 0.05 \
     ${CKPT_PATH:+--resume-from "$CKPT_PATH"}

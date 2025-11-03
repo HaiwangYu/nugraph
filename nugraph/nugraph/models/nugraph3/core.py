@@ -57,7 +57,8 @@ class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
             x_i: Edge features from target nodes
             x_j: Edge features from source nodes
         """
-        return self.edge_net(torch.cat((x_i, x_j), dim=1).detach()) * x_j
+        # return self.edge_net(torch.cat((x_i, x_j), dim=1).detach()) * x_j
+        return self.edge_net(torch.cat((x_i, x_j), dim=1)) * x_j
 
     def update(self, aggr_out: T, x: T) -> T: # pylint: disable=arguments-differ
         """
@@ -77,97 +78,84 @@ class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
 class NuGraphCore(nn.Module):
     """
     NuGraph core message-passing engine
-    
-    This is the core NuGraph message-passing loop
-
-    Args:
-        hit_features: Number of features in planar embedding
-        nexus_features: Number of features in nexus embedding
-        interaction_features: Number of features in interaction embedding
-        use_checkpointing: Whether to use checkpointing
     """
     def __init__(self,
                  hit_features: int,
                  nexus_features: int,
                  interaction_features: int,
-                 use_checkpointing: bool = True):
+                 use_checkpointing: bool = True,
+                 dropedge_sp: float = 0.0):   # <--- NEW
         super().__init__()
 
         self.use_checkpointing = use_checkpointing
+        self.dropedge_sp = float(dropedge_sp)  # probability in [0,1]
 
         # internal planar message-passing
-        self.plane_net = NuGraphBlock(hit_features, hit_features,
-                                      hit_features)
+        self.plane_net = NuGraphBlock(hit_features, hit_features, hit_features)
 
-        # internal nexus message-passing        
-        self.nexus_net = NuGraphBlock(nexus_features, nexus_features,
-                                      nexus_features)
+        # internal nexus message-passing
+        self.nexus_net = NuGraphBlock(nexus_features, nexus_features, nexus_features)
 
         # message-passing from planar nodes to nexus nodes
-        self.plane_to_nexus = NuGraphBlock(hit_features, nexus_features,
-                                           nexus_features)
+        self.plane_to_nexus = NuGraphBlock(hit_features, nexus_features, nexus_features)
 
         # message-passing from nexus nodes to interaction nodes
-        self.nexus_to_interaction = NuGraphBlock(nexus_features,
-                                                 interaction_features,
-                                                 interaction_features)
+        self.nexus_to_interaction = NuGraphBlock(nexus_features, interaction_features, interaction_features)
 
         # message-passing from interaction nodes to nexus nodes
-        self.interaction_to_nexus = NuGraphBlock(interaction_features,
-                                                 nexus_features,
-                                                 nexus_features)
+        self.interaction_to_nexus = NuGraphBlock(interaction_features, nexus_features, nexus_features)
 
         # message-passing from nexus nodes to planar nodes
-        self.nexus_to_plane = NuGraphBlock(nexus_features, hit_features,
-                                           hit_features)
+        self.nexus_to_plane = NuGraphBlock(nexus_features, hit_features, hit_features)
 
     def checkpoint(self, net: nn.Module, *args) -> TD:
-        """
-        Checkpoint module, if enabled.
-        
-        Args:
-            net: Network module
-            args: Arguments to network module
-        """
         if self.use_checkpointing and self.training:
             return checkpoint(net, *args, use_reentrant=False)
         else:
             return net(*args)
 
-    def forward(self, data: Data) -> None:
+    def _maybe_drop_sp_edges(self, edge_index: T) -> T:
         """
-        NuGraphCore forward pass
-        
-        Args:
-            data: Graph data object
+        Apply DropEdge ONLY on sp—nexus—sp edges during training.
         """
+        if not self.training or self.dropedge_sp <= 0.0:
+            return edge_index
+        num_e = edge_index.size(1)
+        if num_e == 0:
+            return edge_index
+        keep_mask = torch.rand(num_e, device=edge_index.device) > self.dropedge_sp
+        # Avoid pathological case of dropping all edges
+        if not keep_mask.any():
+            return edge_index
+        return edge_index[:, keep_mask]
 
+    def forward(self, data: Data) -> None:
         # message-passing in hits
         data["hit"].x = self.checkpoint(
             self.plane_net, data["hit"].x,
             data["hit", "delaunay-planar", "hit"].edge_index)
 
-        # message-passing from hits to nexus
+        # hit -> nexus
         data["sp"].x = self.checkpoint(
             self.plane_to_nexus, (data["hit"].x, data["sp"].x),
             data["hit", "nexus", "sp"].edge_index)
-        
-        # message-passing in blob
-        data["sp"].x = self.checkpoint(
-            self.nexus_net, data["sp"].x, 
-            data["sp","nexus","sp"].edge_index)
 
-        # message-passing from nexus to interaction
+        # nexus (sp—nexus—sp) with targeted DropEdge
+        sp_edge_index = data["sp", "nexus", "sp"].edge_index
+        sp_edge_index = self._maybe_drop_sp_edges(sp_edge_index)
+        data["sp"].x = self.checkpoint(self.nexus_net, data["sp"].x, sp_edge_index)
+
+        # nexus -> interaction
         data["evt"].x = self.checkpoint(
             self.nexus_to_interaction, (data["sp"].x, data["evt"].x),
             data["sp", "in", "evt"].edge_index)
 
-        # message-passing from interaction to nexus
+        # interaction -> nexus (reverse edges)
         data["sp"].x = self.checkpoint(
             self.interaction_to_nexus, (data["evt"].x, data["sp"].x),
-            data["sp", "in", "evt"].edge_index[(1,0), :])
+            data["sp", "in", "evt"].edge_index[(1, 0), :])
 
-        # message-passing from nexus to hits
+        # nexus -> hits (reverse edges)
         data["hit"].x = self.checkpoint(
             self.nexus_to_plane, (data["sp"].x, data["hit"].x),
-            data["hit", "nexus", "sp"].edge_index[(1,0), :])
+            data["hit", "nexus", "sp"].edge_index[(1, 0), :])
