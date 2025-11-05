@@ -146,6 +146,8 @@ def main(args):
         use_checkpointing=args.use_checkpointing,
         lr=args.learning_rate,
         dropedge_sp=args.dropedge_sp,
+        fourier_freqs=args.fourier_freqs,
+        fourier_scale=args.fourier_scale,
     )
     # Ensure FP32 params
     for p in nugraph.parameters():
@@ -218,6 +220,8 @@ def main(args):
         enable_checkpointing=True, # Checkpointing is implicitly handled by callbacks now
         sync_batchnorm=(world_size > 1),
         use_distributed_sampler=True, # Let Lightning handle sampler logic
+        gradient_clip_val=0.0,   # NEW
+        gradient_clip_algorithm="norm",
     )
 
     print(f"[Rank {global_rank}] Starting training...")
@@ -293,5 +297,9 @@ if __name__ == "__main__":
     p.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint file to resume training from (e.g., .../last.ckpt)")
     p.add_argument("--dropedge-sp", type=float, default=0.0,
                    help="DropEdge probability for pp-edges (sp—nexus—sp). 0.05 recommended for Run A.")
+    p.add_argument("--fourier-freqs", type=int, default=3,
+               help="Fourier frequencies for hit positions (0 disables).")
+    p.add_argument("--fourier-scale", type=float, default=1e-3,
+               help="Base scale for Fourier features.")
     args = p.parse_args()
     main(args)

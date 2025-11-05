@@ -137,7 +137,7 @@ echo "PYTHONPATH=${PYTHONPATH:-}"
 
 # --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw10_ppedges_aw_dropedge005"
+RUN_NAME="nug3_n16_hf256_nf64_it7_lr1e-4_nw0_scw10_ppedges_aw_dropedge0_fourier0"
 
 # --- DEFINE THE CHECKPOINT PATH ---
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
@@ -165,5 +165,6 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --nexus-features 64 \
     --interaction-features 32 \
     --in-features 8 \
-    --dropedge-sp 0.05 \
+    --dropedge-sp 0.0 \
+    --fourier-freqs 0 --fourier-scale 1e-3 \
     ${CKPT_PATH:+--resume-from "$CKPT_PATH"}
