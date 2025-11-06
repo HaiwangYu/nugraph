@@ -1,174 +1,174 @@
-# filename: nugraph/nugraph/models/nugraph3/core.py
-"""NuGraph core message-passing engine (with deterministic DropEdge on sp↔sp)."""
+"""NuGraph core message-passing engine"""
 import torch
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 from torch_geometric.nn import MessagePassing
 from .types import T, TD, Data
 
-
-def _dropedge_deterministic(edge_index: torch.Tensor, p: float) -> torch.Tensor:
+class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
     """
-    Deterministic DropEdge mask based on hashing the edge indices, so all DDP ranks
-    keep/drop the same edges given identical edge_index. Never drops all edges.
+    Standard NuGraph message-passing block
+    
+    This block generates attention weights for each graph edge based on both
+    the source and target node features, and then applies those weights to
+    the source node features in order to form messages. These messages are
+    then aggregated into the target nodes using softmax aggregation, and
+    then fed into a two-layer MLP to generate updated target node features.
 
     Args:
-        edge_index: LongTensor [2, E]
-        p: drop probability in [0, 1)
-
-    Returns:
-        Filtered edge_index with ~ (1 - p) fraction of edges kept.
+        source_features: Number of source node input features
+        target_features: Number of target node input features
+        out_features: Number of target node output features
     """
-    if p <= 0.0 or edge_index.numel() == 0:
-        return edge_index
-
-    # Vectorized 64-bit mix -> take low 32 bits as a pseudo-uniform
-    ei0 = edge_index[0].to(torch.int64)
-    ei1 = edge_index[1].to(torch.int64)
-
-    x = ei0 ^ (ei1 * 0x9E3779B97F4A7C15)       # mix
-    x ^= (x >> 30)
-    x *= 0xBF58476D1CE4E5B9
-    x ^= (x >> 27)
-    x *= 0x94D049BB133111EB
-    x ^= (x >> 31)
-
-    u = (x & ((1 << 32) - 1)).to(torch.float32) / float(1 << 32)  # [0,1)
-    keep = u >= p
-    if keep.sum() == 0:
-        return edge_index  # avoid empty graph
-    return edge_index[:, keep]
-
-
-class NuGraphBlock(MessagePassing):  # pylint: disable=abstract-method
-    """
-    Standard NuGraph message-passing block.
-
-    Generates attention weights per edge from (x_i, x_j), applies them to x_j,
-    aggregates with softmax, then updates target node features via a small MLP.
-    """
-
-    def __init__(self, source_features: int, target_features: int, out_features: int):
+    def __init__(self, source_features: int, target_features: int,
+                 out_features: int):
         super().__init__(aggr="softmax")
 
         self.edge_net = nn.Sequential(
-            nn.Linear(source_features + target_features, 1),
-            nn.Sigmoid()
-        )
+            nn.Linear(source_features+target_features, 1),
+            nn.Sigmoid())
 
         self.net = nn.Sequential(
-            nn.Linear(source_features + target_features, out_features),
+            nn.Linear(source_features+target_features, out_features),
             nn.Mish(),
             nn.Linear(out_features, out_features),
-            nn.Mish()
-        )
+            nn.Mish())
 
-    def forward(self, x: T, edge_index: T) -> T:  # pylint: disable=arguments-differ
+    def forward(self, x: T, edge_index: T) -> T: # pylint: disable=arguments-differ
+        """
+        NuGraphBlock forward pass
+        
+        Args:
+            x: Node feature tensor
+            edge_index: Edge index tensor
+        """
         return self.propagate(edge_index, x=x)
 
-    def message(self, x_i: T, x_j: T) -> T:  # pylint: disable=arguments-differ
-        # Detach attention inputs to stabilize training (as in your baseline)
-        att = self.edge_net(torch.cat((x_i, x_j), dim=1).detach())
-        return att * x_j
+    def message(self, x_i: T, x_j: T) -> T: # pylint: disable=arguments-differ
+        """
+        NuGraphBlock message function
 
-    def update(self, aggr_out: T, x: T) -> T:  # pylint: disable=arguments-differ
+        This function constructs messages on graph edges. Features from the
+        source and target nodes are concatenated and fed into a linear layer
+        to construct attention weights. Messages are then formed on edges by
+        weighting the source node features by these attention weights.
+        
+        Args:
+            x_i: Edge features from target nodes
+            x_j: Edge features from source nodes
+        """
+        # return self.edge_net(torch.cat((x_i, x_j), dim=1).detach()) * x_j
+        return self.edge_net(torch.cat((x_i, x_j), dim=1)) * x_j
+
+    def update(self, aggr_out: T, x: T) -> T: # pylint: disable=arguments-differ
+        """
+        NuGraphBlock update function
+
+        This function takes the output node features and combines them with
+        the input features
+
+        Args:
+            aggr_out: Tensor of aggregated node features
+            x: Target node features
+        """
         if isinstance(x, tuple):
             _, x = x
         return self.net(torch.cat((aggr_out, x), dim=1))
 
-
 class NuGraphCore(nn.Module):
     """
-    NuGraph core message-passing engine.
+    NuGraph core message-passing engine
+    
+    This is the core NuGraph message-passing loop
 
     Args:
-        hit_features: planar hit feature dim
-        nexus_features: nexus feature dim
-        interaction_features: interaction feature dim
-        use_checkpointing: enable gradient checkpointing for MP blocks
-        dropedge_sp: DropEdge probability applied ONLY to ("sp","nexus","sp") edges
+        hit_features: Number of features in planar embedding
+        nexus_features: Number of features in nexus embedding
+        interaction_features: Number of features in interaction embedding
+        use_checkpointing: Whether to use checkpointing
     """
-
-    def __init__(
-        self,
-        hit_features: int,
-        nexus_features: int,
-        interaction_features: int,
-        use_checkpointing: bool = True,
-        dropedge_sp: float = 0.0,
-    ):
+    def __init__(self,
+                 hit_features: int,
+                 nexus_features: int,
+                 interaction_features: int,
+                 use_checkpointing: bool = True):
         super().__init__()
 
         self.use_checkpointing = use_checkpointing
-        self.dropedge_sp = float(dropedge_sp)
 
         # internal planar message-passing
-        self.plane_net = NuGraphBlock(hit_features, hit_features, hit_features)
+        self.plane_net = NuGraphBlock(hit_features, hit_features,
+                                      hit_features)
 
-        # internal nexus message-passing
-        self.nexus_net = NuGraphBlock(nexus_features, nexus_features, nexus_features)
+        # internal nexus message-passing        
+        self.nexus_net = NuGraphBlock(nexus_features, nexus_features,
+                                      nexus_features)
 
         # message-passing from planar nodes to nexus nodes
-        self.plane_to_nexus = NuGraphBlock(hit_features, nexus_features, nexus_features)
+        self.plane_to_nexus = NuGraphBlock(hit_features, nexus_features,
+                                           nexus_features)
 
         # message-passing from nexus nodes to interaction nodes
-        self.nexus_to_interaction = NuGraphBlock(
-            nexus_features, interaction_features, interaction_features
-        )
+        self.nexus_to_interaction = NuGraphBlock(nexus_features,
+                                                 interaction_features,
+                                                 interaction_features)
 
         # message-passing from interaction nodes to nexus nodes
-        self.interaction_to_nexus = NuGraphBlock(
-            interaction_features, nexus_features, nexus_features
-        )
+        self.interaction_to_nexus = NuGraphBlock(interaction_features,
+                                                 nexus_features,
+                                                 nexus_features)
 
         # message-passing from nexus nodes to planar nodes
-        self.nexus_to_plane = NuGraphBlock(nexus_features, hit_features, hit_features)
+        self.nexus_to_plane = NuGraphBlock(nexus_features, hit_features,
+                                           hit_features)
 
     def checkpoint(self, net: nn.Module, *args) -> TD:
+        """
+        Checkpoint module, if enabled.
+        
+        Args:
+            net: Network module
+            args: Arguments to network module
+        """
         if self.use_checkpointing and self.training:
             return checkpoint(net, *args, use_reentrant=False)
         else:
             return net(*args)
 
     def forward(self, data: Data) -> None:
+        """
+        NuGraphCore forward pass
+        
+        Args:
+            data: Graph data object
+        """
+
         # message-passing in hits
         data["hit"].x = self.checkpoint(
-            self.plane_net,
-            data["hit"].x,
-            data["hit", "delaunay-planar", "hit"].edge_index,
-        )
+            self.plane_net, data["hit"].x,
+            data["hit", "delaunay-planar", "hit"].edge_index)
 
         # message-passing from hits to nexus
         data["sp"].x = self.checkpoint(
-            self.plane_to_nexus,
-            (data["hit"].x, data["sp"].x),
-            data["hit", "nexus", "sp"].edge_index,
-        )
-
-        # message-passing in nexus with deterministic DropEdge
-        sp_sp_ei = data["sp", "nexus", "sp"].edge_index
-        if self.training and self.dropedge_sp > 0.0:
-            sp_sp_ei = _dropedge_deterministic(sp_sp_ei, self.dropedge_sp)
-
-        data["sp"].x = self.checkpoint(self.nexus_net, data["sp"].x, sp_sp_ei)
+            self.plane_to_nexus, (data["hit"].x, data["sp"].x),
+            data["hit", "nexus", "sp"].edge_index)
+        
+        # message-passing in blob
+        data["sp"].x = self.checkpoint(
+            self.nexus_net, data["sp"].x, 
+            data["sp","nexus","sp"].edge_index)
 
         # message-passing from nexus to interaction
         data["evt"].x = self.checkpoint(
-            self.nexus_to_interaction,
-            (data["sp"].x, data["evt"].x),
-            data["sp", "in", "evt"].edge_index,
-        )
+            self.nexus_to_interaction, (data["sp"].x, data["evt"].x),
+            data["sp", "in", "evt"].edge_index)
 
-        # message-passing from interaction to nexus (reverse edge order)
+        # message-passing from interaction to nexus
         data["sp"].x = self.checkpoint(
-            self.interaction_to_nexus,
-            (data["evt"].x, data["sp"].x),
-            data["sp", "in", "evt"].edge_index[(1, 0), :],
-        )
+            self.interaction_to_nexus, (data["evt"].x, data["sp"].x),
+            data["sp", "in", "evt"].edge_index[(1,0), :])
 
-        # message-passing from nexus to hits (reverse edge order)
+        # message-passing from nexus to hits
         data["hit"].x = self.checkpoint(
-            self.nexus_to_plane,
-            (data["sp"].x, data["hit"].x),
-            data["hit", "nexus", "sp"].edge_index[(1, 0), :],
-        )
+            self.nexus_to_plane, (data["sp"].x, data["hit"].x),
+            data["hit", "nexus", "sp"].edge_index[(1,0), :])

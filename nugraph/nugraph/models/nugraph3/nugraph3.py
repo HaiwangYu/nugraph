@@ -73,9 +73,7 @@ class NuGraph3(LightningModule):
                  instance_head: bool = False,
                  spacepoint_head: bool = False,
                  use_checkpointing: bool = False,
-                 lr: float = 0.001,
-                 dropedge_sp: float = 0.0,
-                 fourier_freqs: int = 0, fourier_scale: float = 1.0):
+                 lr: float = 0.001):
         super().__init__()
 
         warnings.filterwarnings("ignore", ".*NaN values found in confusion matrix.*")
@@ -91,14 +89,12 @@ class NuGraph3(LightningModule):
         self.lr = lr
 
         self.encoder = Encoder(in_features, hit_features,
-                               nexus_features, interaction_features,
-                               fourier_freqs=fourier_freqs, fourier_scale=fourier_scale)
+                               nexus_features, interaction_features)
 
         self.core_net = NuGraphCore(hit_features,
                                     nexus_features,
                                     interaction_features,
-                                    use_checkpointing,
-                                    dropedge_sp=dropedge_sp)
+                                    use_checkpointing)
 
         self.decoders = []
 
@@ -160,10 +156,6 @@ class NuGraph3(LightningModule):
         loss, metrics = self(batch, 'train')
         self.log('loss/train', loss, batch_size=batch.num_graphs, prog_bar=True)
         self.log_dict(metrics, batch_size=batch.num_graphs)
-        if not torch.isfinite(loss):
-            # Optional: dump a few stats for debugging
-            raise RuntimeError("Loss became non-finite (NaN/Inf). Check Fourier inputs and class weights.")
-
         return loss
 
     def on_train_epoch_end(self) -> None:
@@ -259,13 +251,6 @@ class NuGraph3(LightningModule):
                            help='Maximum number of epochs to train for')
         model.add_argument('--learning-rate', type=float, default=0.001,
                            help='Max learning rate during training')
-        model.add_argument('--dropedge-sp', type=float, default=0.0,
-                           help='DropEdge probability for ("sp","nexus","sp") edges (0.0 disables).')
-        model.add_argument('--fourier-freqs', type=int, default=0,
-                           help='# of Fourier frequencies for hit positions (0 disables).') 
-        model.add_argument('--fourier-scale', type=float, default=1e-3,
-                           help='Base scale for Fourier features.') 
-        
         return parser
 
     @classmethod
@@ -294,8 +279,4 @@ class NuGraph3(LightningModule):
             instance_head=args.instance,
             spacepoint_head=args.spacepoint,
             use_checkpointing=args.use_checkpointing,
-            lr=args.learning_rate,
-            dropedge_sp=getattr(args, "dropedge_sp", 0.0),
-            fourier_freqs=getattr(args, "fourier_freqs", 0),
-            fourier_scale=getattr(args, "fourier_scale", 1e-3),
-            )
+            lr=args.learning_rate)
