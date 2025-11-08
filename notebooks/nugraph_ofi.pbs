@@ -165,5 +165,4 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --nexus-features 64 \
     --interaction-features 32 \
     --in-features 8 \
-    # --dropedge-sp 0.05 \
     ${CKPT_PATH:+--resume-from "$CKPT_PATH"}

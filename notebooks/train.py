@@ -121,6 +121,36 @@ def main(args):
     print(f"[Rank {global_rank}] Setting up DataModule...")
     nudata.setup("fit") # Call setup AFTER configuring loader params if possible
     print(f"[Rank {global_rank}] DataModule setup complete.")
+    
+    # === SANITY A: confirm semantic class order from file ===
+    if global_rank == 0:
+        print("[Sanity] semantic_classes from H5:", getattr(nudata, "semantic_classes", None))
+        print("[Sanity] event_classes from H5:", getattr(nudata, "event_classes", None))
+        print("[Sanity] You passed --semantic-class-weight =", args.semantic_class_weight,
+            "(interpreted in the EXACT order printed above).")
+
+    # === SANITY B: inspect one train batch (transformed) ===
+    if global_rank == 0:
+        try:
+            td = nudata.train_dataloader()
+            batch = next(iter(td))  # one batch
+            y = batch["hit"].y_semantic
+            uniques, counts = torch.unique(y, return_counts=True)
+            print("[Sanity] y_semantic unique values (with counts):",
+                  {int(u.item()): int(c.item()) for u, c in zip(uniques, counts)})
+
+            sc = getattr(nudata, "semantic_classes", None)
+            if sc is not None:
+                mask = y >= 0
+                if mask.any():
+                    yv = y[mask]
+                    for idx in range(len(sc)):
+                        n = int((yv == idx).sum().item())
+                        print(f"[Sanity] hits with class index {idx} ('{sc[idx]}'): {n}")
+                else:
+                    print("[Sanity] No labeled hits (all -1) in this sampled batch.")
+        except Exception as e:
+            print("[Sanity] Could not inspect a batch:", e)
 
     model_semantic_classes = getattr(nudata, "semantic_classes", None)
     if args.semantic_head and model_semantic_classes is None:
@@ -147,6 +177,16 @@ def main(args):
         lr=args.learning_rate,
         # dropedge_sp=args.dropedge_sp,
     )
+
+    # === SANITY C: head output dimension matches class count ===
+    if global_rank == 0 and hasattr(nugraph, "semantic_decoder"):
+        try:
+            out_dim = nugraph.semantic_decoder.net[-1].out_features
+            sc = getattr(nudata, "semantic_classes", None)
+            print(f"[Sanity] semantic head out_features = {out_dim} vs len(semantic_classes) = {len(sc) if sc else None}")
+        except Exception as e:
+            print("[Sanity] Could not read semantic head output dim:", e)
+
     # Ensure FP32 params
     for p in nugraph.parameters():
         if p.dtype != torch.float32:
