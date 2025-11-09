@@ -1,3 +1,4 @@
+#!/usr/bin/env python
 # notebooks/eval_semantic.py
 import os
 import argparse
@@ -27,18 +28,39 @@ def parse_args():
     p.add_argument("--beta", type=float, default=None,
                    help="If provided, choose threshold that maximizes Fβ on the chosen split "
                         "(β<1 favors precision; β>1 favors recall). If omitted, uses best-F1.")
+
+    # NEW: neutrino-hit cut controls (must match your DataModule)
+    p.add_argument("--min-nu-hits", type=int, default=None,
+                   help="If set, only evaluate events with at least this many neutrino hits "
+                        "(as defined by nu_cut_plane/nu_class_index).")
+    p.add_argument("--nu-cut-plane", type=str, default="any",
+                   choices=["any", "sum", "u", "v", "y"],
+                   help="How to count neutrino hits for the cut: "
+                        "'any' = ≥min on any plane; 'sum' = sum(U+V+Y) ≥min; "
+                        "or restrict to a specific plane.")
+    p.add_argument("--nu-class-index", type=int, default=0,
+                   help="Index of the 'nu' class inside semantic_classes (default 0).")
     return p.parse_args()
 
 
-def make_datamodule(ng, data_path, model_cls, batch_size=None, num_workers=None):
+def make_datamodule(ng, data_path, model_cls,
+                    batch_size=None, num_workers=None,
+                    min_nu_hits=None, nu_cut_plane="any", nu_class_index=0):
     """
-    Recreate exactly what you did in train.ipynb:
+    Recreate exactly what you did in training:
         Data = ng.data.NuGraphDataModule
         Model = ng.models.NuGraph3
-        nudata = Data(model=Model, data_path=...)
+        nudata = Data(model=Model, data_path=..., min_nu_hits=..., nu_cut_plane=..., nu_hit_class_index=...)
     """
     Data = ng.data.NuGraphDataModule
-    dm = Data(model=model_cls, data_path=data_path)
+    dm = Data(
+        model=model_cls,
+        data_path=data_path,
+        # forward neutrino-hit cut args if present in your DataModule
+        min_nu_hits=min_nu_hits,
+        # nu_cut_plane=nu_cut_plane,
+        # nu_hit_class_index=nu_class_index,
+    )
 
     # Optional overrides
     if batch_size is not None and hasattr(dm, "batch_size"):
@@ -49,6 +71,16 @@ def make_datamodule(ng, data_path, model_cls, batch_size=None, num_workers=None)
                 setattr(dm, attr, num_workers)
 
     dm.setup("test")
+
+    # Small heads-up on what we’re actually evaluating on
+    try:
+        n_val = len(dm.val_dataset)
+        n_test = len(dm.test_dataset)
+        print(f"[Info] Eval datasets after cut (min_nu_hits={min_nu_hits}, nu_cut_plane='{nu_cut_plane}', nu_class_index={nu_class_index}):")
+        print(f"       val:  {n_val} samples | test: {n_test} samples")
+    except Exception:
+        pass
+
     return dm
 
 
@@ -207,13 +239,16 @@ def main():
     import nugraph as ng
     Model = ng.models.NuGraph3
 
-    # DataModule exactly as training
+    # DataModule exactly as training, now with neutrino-hit cuts forwarded
     dm = make_datamodule(
         ng,
         data_path=args.data_path,
         model_cls=Model,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        min_nu_hits=args.min_nu_hits,
+        # nu_cut_plane=args.nu_cut_plane,
+        nu_class_index=args.nu_class_index,
     )
 
     # Load model

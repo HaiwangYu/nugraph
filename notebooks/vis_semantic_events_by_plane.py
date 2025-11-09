@@ -76,6 +76,10 @@ def parse_args():
     p.add_argument("--max-points", type=int, default=None,
                    help="Randomly subsample at most this many hits per event for speed/clarity.")
     p.add_argument("--debug", action="store_true")
+    
+    p.add_argument("--min-nu-hits", type=int, default=0,
+               help="Keep only events with ≥ this many ν hits (sum over U+V+Y) in the chosen split.")
+
 
     return p.parse_args()
 
@@ -186,7 +190,7 @@ def main():
 
     # Build DataModule and OVERRIDE eval batch size & workers
     Data = ng.data.NuGraphDataModule
-    dm = Data(model=Model, data_path=args.data_path)
+    dm = Data(model=Model, data_path=args.data_path, min_nu_hits=args.min_nu_hits)
     dm.setup("test")
     # Override batch size/num_workers consistently
     for attr in ("batch_size", "batch_size_eval"):

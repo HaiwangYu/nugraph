@@ -6,6 +6,7 @@ import os
 import sys
 import h5py
 import tqdm
+import numpy as np  # NEW: used for filtering masks
 
 import torch
 from torch_geometric.loader import DataLoader
@@ -23,7 +24,9 @@ class NuGraphDataModule(LightningDataModule):
                  batch_size: int = 64,
                  num_workers: int = 5,
                  shuffle: str = 'random',
-                 balance_frac: float = 0.1):
+                 balance_frac: float = 0.1,
+                 min_nu_hits: int = 0  # NEW: neutrino-hit cut (0 = no cut)
+                 ):
         super().__init__()
 
         # for this HDF5 dataloader, worker processes slow things down
@@ -40,6 +43,7 @@ class NuGraphDataModule(LightningDataModule):
             sys.exit()
         self.shuffle = shuffle
         self.balance_frac = balance_frac
+        self.min_nu_hits = int(min_nu_hits) if min_nu_hits is not None else 0  # NEW
 
         with h5py.File(self.filename) as f:
 
@@ -72,8 +76,8 @@ class NuGraphDataModule(LightningDataModule):
             try:
                 # pylint: disable=no-member
                 train_samples = f['samples/train'].asstr()[()]
-                val_samples = f['samples/validation'].asstr()[()]
-                test_samples = f['samples/test'].asstr()[()]
+                val_samples   = f['samples/validation'].asstr()[()]
+                test_samples  = f['samples/test'].asstr()[()]
             except KeyError:
                 print(("Sample splits not found in file! "
                        "Call \"generate_samples\" to create them."))
@@ -87,11 +91,75 @@ class NuGraphDataModule(LightningDataModule):
                        "Call \"generate_samples\" to create it."))
                 sys.exit()
 
+            # -------- NEW: apply min_nu_hits cut to all splits --------
+            if self.min_nu_hits > 0:
+                # Determine index of 'nu' in semantic_classes (fallback to 0)
+                try:
+                    nu_index = int(self.semantic_classes.index('nu'))
+                except Exception:
+                    nu_index = 0
+
+                def count_nu_hits(rec: np.void, nu_idx: int = 0) -> int:
+                    total = 0
+                    for pl in ("u", "v", "y"):
+                        key = f"{pl}/y_semantic"
+                        if key in rec.dtype.names:
+                            arr = rec[key]
+                            if not isinstance(arr, np.ndarray):
+                                arr = np.asarray(arr)
+                            total += int((arr == nu_idx).sum())
+                    return total
+
+                def keep_mask_for(keys_array):
+                    """Return boolean mask of which keys pass the min_nu_hits cut."""
+                    mask = np.zeros(len(keys_array), dtype=bool)
+                    for i, name in enumerate(keys_array):
+                        rec = f['dataset'][name][()]  # scalar compound
+                        mask[i] = (count_nu_hits(rec, nu_index) >= self.min_nu_hits)
+                    return mask
+
+                # Train split
+                train_samples_np = np.asarray(train_samples)
+                train_mask = keep_mask_for(train_samples_np)
+                if not train_mask.any():
+                    print(f"[Data] min_nu_hits={self.min_nu_hits}: train 0 kept (all filtered).")
+                    # Allow empty, but warn:
+                before, after = len(train_samples_np), int(train_mask.sum())
+                if after != before:
+                    print(f"[Data] min_nu_hits={self.min_nu_hits}: train {before} -> {after}")
+                train_samples = train_samples_np[train_mask]
+
+                # Keep train_datasize aligned with filtered train_samples
+                if len(self.train_datasize) == before:
+                    self.train_datasize = self.train_datasize[train_mask]
+                else:
+                    # If lengths disagree, fall back to not using BalanceSampler safely
+                    # but we keep the filtered samples.
+                    print("[Data] Warning: datasize/train length mismatch after filtering; "
+                          "BalanceSampler may not be used effectively for this run.")
+
+                # Validation split
+                val_samples_np = np.asarray(val_samples)
+                val_mask = keep_mask_for(val_samples_np)
+                before, after = len(val_samples_np), int(val_mask.sum())
+                if after != before:
+                    print(f"[Data] min_nu_hits={self.min_nu_hits}: validation {before} -> {after}")
+                val_samples = val_samples_np[val_mask]
+
+                # Test split
+                test_samples_np = np.asarray(test_samples)
+                test_mask = keep_mask_for(test_samples_np)
+                before, after = len(test_samples_np), int(test_mask.sum())
+                if after != before:
+                    print(f"[Data] min_nu_hits={self.min_nu_hits}: test {before} -> {after}")
+                test_samples = test_samples_np[test_mask]
+            # -------- END NEW filtering --------
+
         transform = model.transform(self.planes) if model else None
 
         self.train_dataset = NuGraphDataset(self.filename, train_samples, transform)
-        self.val_dataset = NuGraphDataset(self.filename, val_samples, transform)
-        self.test_dataset = NuGraphDataset(self.filename, test_samples, transform)
+        self.val_dataset   = NuGraphDataset(self.filename, val_samples,   transform)
+        self.test_dataset  = NuGraphDataset(self.filename, test_samples,  transform)
 
     @staticmethod
     def generate_samples(data_path: str):
@@ -184,4 +252,7 @@ class NuGraphDataModule(LightningDataModule):
                           help='Dataset shuffling scheme to use')
         data.add_argument('--balance-frac', type=float, default=0.1,
                           help='Fraction of dataset to use for workload balancing')
+        data.add_argument('--min-nu-hits', type=int, default=0,   # NEW
+                          help='Require at least this many ν hits (label index for "nu") '
+                               'per event across U/V/Y; 0 disables the cut.')
         return parser

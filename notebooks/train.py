@@ -75,6 +75,19 @@ def main(args):
     log_base_dir = Path(args.log_dir); log_base_dir.mkdir(parents=True, exist_ok=True)
     run_name = args.run_name
     logdir = log_base_dir / run_name
+    
+    # put these near the top of train.py, before WandbLogger is constructed
+    os.environ.setdefault("WANDB_DIR",            str(logdir / "wandb"))
+    os.environ.setdefault("WANDB_CACHE_DIR",      str(logdir / "wandb_cache"))
+    os.environ.setdefault("WANDB_ARTIFACTS_DIR",  str(logdir / "wandb_artifacts"))
+    os.environ.setdefault("WANDB_DISABLE_CODE",  "true")   # optional space saver
+    
+    (Path(os.environ["WANDB_DIR"]).mkdir(parents=True, exist_ok=True))
+    (Path(os.environ["WANDB_CACHE_DIR"]).mkdir(parents=True, exist_ok=True))
+    (Path(os.environ["WANDB_ARTIFACTS_DIR"]).mkdir(parents=True, exist_ok=True))
+    
+
+
     # Create dir on all ranks for consistency before logger tries to
     if not logdir.exists():
         try:
@@ -87,7 +100,7 @@ def main(args):
         # Try creating WandbLogger on all ranks. It self-gates internally.
         # Check if WANDB_MODE is offline before initializing
         wandb_mode = os.environ.get("WANDB_MODE", "online")
-        logger = WandbLogger(save_dir=logdir, project="nugraph3", name=run_name, log_model="all", offline=(wandb_mode=="offline"))
+        logger = WandbLogger(save_dir=logdir, project="nugraph3", name=run_name, log_model="False", offline=(wandb_mode=="offline"))
         if global_rank == 0: print(f"[Rank 0] WandbLogger initialized (mode: {wandb_mode}).")
     except Exception as e:
         # Fallback to CSVLogger on ALL ranks if W&B fails
@@ -100,7 +113,7 @@ def main(args):
 
     # Add print statement to verify num_workers
     print(f"[Rank {global_rank}] Initializing DataModule with num_workers = {args.num_workers}")
-    nudata = DataModule(model=Model, data_path=args.data_path, num_workers=args.num_workers, batch_size=args.batch_size)
+    nudata = DataModule(model=Model, data_path=args.data_path, num_workers=args.num_workers, batch_size=args.batch_size, min_nu_hits=args.min_nu_hits)
 
     # Make dataloading conservative for multi-node HDF5
     for attr, val in [
@@ -121,6 +134,12 @@ def main(args):
     print(f"[Rank {global_rank}] Setting up DataModule...")
     nudata.setup("fit") # Call setup AFTER configuring loader params if possible
     print(f"[Rank {global_rank}] DataModule setup complete.")
+    
+    print(f"[Rank {global_rank}] DataModule setup complete.")
+    print(f"[Rank {global_rank}] Split sizes after min_nu_hits={args.min_nu_hits}: "
+        f"train={len(nudata.train_dataset)}, "
+        f"val={len(nudata.val_dataset)}, "
+        f"test={len(nudata.test_dataset)}")
     
     # === SANITY A: confirm semantic class order from file ===
     if global_rank == 0:
@@ -331,7 +350,11 @@ if __name__ == "__main__":
     p.add_argument("--use-checkpointing", dest="use_checkpointing", action="store_true", default=True, help="Enable gradient checkpointing (default).")
     p.add_argument("--no-checkpointing", dest="use_checkpointing", action="store_false", help="Disable gradient checkpointing.")
     p.add_argument("--resume-from", type=str, default=None, help="Path to checkpoint file to resume training from (e.g., .../last.ckpt)")
-    # p.add_argument("--dropedge-sp", type=float, default=0.0,
-    #                help="DropEdge probability for pp-edges (sp—nexus—sp). 0.05 recommended for Run A.")
+    p.add_argument(
+        "--min-nu-hits",
+        type=int,
+        default=0,
+        help="Require at least this many 'nu' hits per event (U+V+Y). 0 disables the cut."
+    )
     args = p.parse_args()
     main(args)
