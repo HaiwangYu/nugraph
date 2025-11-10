@@ -6,10 +6,11 @@ import os
 import sys
 import h5py
 import tqdm
-import numpy as np  # NEW: used for filtering masks
+import numpy as np  # used for filtering masks & weights
 
 import torch
 from torch_geometric.loader import DataLoader
+from torch.utils.data import WeightedRandomSampler  # NEW: for ν-hit weighted sampling
 from pytorch_lightning import LightningDataModule
 
 from ..data import NuGraphDataset, BalanceSampler
@@ -25,7 +26,7 @@ class NuGraphDataModule(LightningDataModule):
                  num_workers: int = 5,
                  shuffle: str = 'random',
                  balance_frac: float = 0.1,
-                 min_nu_hits: int = 0  # NEW: neutrino-hit cut (0 = no cut)
+                 min_nu_hits: int = 0  # neutrino-hit cut (0 = no cut)
                  ):
         super().__init__()
 
@@ -38,12 +39,17 @@ class NuGraphDataModule(LightningDataModule):
         self.filename = os.path.expandvars(data_path)
         self.batch_size = batch_size
         self.num_workers = num_workers
-        if shuffle not in ("random", "balance"):
-            print('shuffle argument must be "random" or "balance".')
+
+        # allow "weighted" in addition to your existing choices
+        if shuffle not in ("random", "balance", "weighted"):
+            print('shuffle argument must be "random", "balance", or "weighted".')
             sys.exit()
         self.shuffle = shuffle
         self.balance_frac = balance_frac
-        self.min_nu_hits = int(min_nu_hits) if min_nu_hits is not None else 0  # NEW
+        self.min_nu_hits = int(min_nu_hits) if min_nu_hits is not None else 0
+
+        # will hold per-train-sample weights when using weighted sampling
+        self.train_event_weights = None  # NEW
 
         with h5py.File(self.filename) as f:
 
@@ -58,7 +64,6 @@ class NuGraphDataModule(LightningDataModule):
                 sys.exit()
 
             # get graph structure generation
-            # if that info is missing, it's first generation
             try:
                 # pylint: disable=no-member
                 self.gen = f["gen"][()].item()
@@ -91,24 +96,25 @@ class NuGraphDataModule(LightningDataModule):
                        "Call \"generate_samples\" to create it."))
                 sys.exit()
 
-            # -------- NEW: apply min_nu_hits cut to all splits --------
-            if self.min_nu_hits > 0:
-                # Determine index of 'nu' in semantic_classes (fallback to 0)
-                try:
-                    nu_index = int(self.semantic_classes.index('nu'))
-                except Exception:
-                    nu_index = 0
+            # -------- neutrino-hit helpers (used by filtering and weighting) --------
+            try:
+                nu_index = int(self.semantic_classes.index('nu'))
+            except Exception:
+                nu_index = 0
 
-                def count_nu_hits(rec: np.void, nu_idx: int = 0) -> int:
-                    total = 0
-                    for pl in ("u", "v", "y"):
-                        key = f"{pl}/y_semantic"
-                        if key in rec.dtype.names:
-                            arr = rec[key]
-                            if not isinstance(arr, np.ndarray):
-                                arr = np.asarray(arr)
-                            total += int((arr == nu_idx).sum())
-                    return total
+            def count_nu_hits(rec: np.void, nu_idx: int = 0) -> int:
+                total = 0
+                for pl in ("u", "v", "y"):
+                    key = f"{pl}/y_semantic"
+                    if key in rec.dtype.names:
+                        arr = rec[key]
+                        if not isinstance(arr, np.ndarray):
+                            arr = np.asarray(arr)
+                        total += int((arr == nu_idx).sum())
+                return total
+
+            # -------- apply min_nu_hits cut to all splits (if requested) --------
+            if self.min_nu_hits > 0:
 
                 def keep_mask_for(keys_array):
                     """Return boolean mask of which keys pass the min_nu_hits cut."""
@@ -123,7 +129,6 @@ class NuGraphDataModule(LightningDataModule):
                 train_mask = keep_mask_for(train_samples_np)
                 if not train_mask.any():
                     print(f"[Data] min_nu_hits={self.min_nu_hits}: train 0 kept (all filtered).")
-                    # Allow empty, but warn:
                 before, after = len(train_samples_np), int(train_mask.sum())
                 if after != before:
                     print(f"[Data] min_nu_hits={self.min_nu_hits}: train {before} -> {after}")
@@ -133,8 +138,6 @@ class NuGraphDataModule(LightningDataModule):
                 if len(self.train_datasize) == before:
                     self.train_datasize = self.train_datasize[train_mask]
                 else:
-                    # If lengths disagree, fall back to not using BalanceSampler safely
-                    # but we keep the filtered samples.
                     print("[Data] Warning: datasize/train length mismatch after filtering; "
                           "BalanceSampler may not be used effectively for this run.")
 
@@ -153,7 +156,27 @@ class NuGraphDataModule(LightningDataModule):
                 if after != before:
                     print(f"[Data] min_nu_hits={self.min_nu_hits}: test {before} -> {after}")
                 test_samples = test_samples_np[test_mask]
-            # -------- END NEW filtering --------
+
+            # -------- build ν-hit-based sampling weights for TRAIN (shuffle=weighted) --------
+            if self.shuffle == "weighted":
+                train_samples_np = np.asarray(train_samples)
+                if len(train_samples_np) > 0:
+                    nu_hits = np.empty(len(train_samples_np), dtype=np.int64)
+                    for i, name in enumerate(train_samples_np):
+                        rec = f['dataset'][name][()]  # scalar compound
+                        nu_hits[i] = count_nu_hits(rec, nu_index)
+
+                    # Up-weight small-ν events smoothly:
+                    # w = (nu_hits / median)^(-alpha), clipped to [0.5,5.0], normalized
+                    alpha = 1.0
+                    med = max(1.0, float(np.median(nu_hits)))
+                    w = (np.maximum(nu_hits, 1) / med) ** (-alpha)
+                    w = np.clip(w, 0.5, 5.0)
+                    w = w * (len(w) / w.sum())  # optional normalization
+                    self.train_event_weights = torch.as_tensor(w, dtype=torch.double)
+                else:
+                    self.train_event_weights = None
+            # --------------------------------------------------------------------
 
         transform = model.transform(self.planes) if model else None
 
@@ -190,6 +213,7 @@ class NuGraphDataModule(LightningDataModule):
         with h5py.File(data_path, "r+") as f:
             if 'datasize/train' in f:
                 del f['datasize/train']
+        # NOTE: PositionFeatures import not shown here; assumed available in your repo
         transform = PositionFeatures(planes)
         dataset = NuGraphDataset(data_path, train, transform)
         def datasize(data):
@@ -207,17 +231,26 @@ class NuGraphDataModule(LightningDataModule):
         train_len = len(self.train_dataset)
         drop_last = train_len >= self.batch_size
 
+        sampler = None
+        shuffle = True
+
         if self.shuffle == 'balance' and drop_last:
             shuffle = False
             sampler = BalanceSampler.BalanceSampler(
                         datasize=self.train_datasize,
                         batch_size=self.batch_size,
                         balance_frac=self.balance_frac)
-        else:
-            # fall back to standard shuffling when the dataset is too small
-            # for balanced sampling to produce at least one full batch
-            shuffle = True
-            sampler = None
+
+        elif self.shuffle == 'weighted' and self.train_event_weights is not None:
+            # Weighted sampling based on per-event ν-hit counts
+            shuffle = False
+            sampler = WeightedRandomSampler(
+                weights=self.train_event_weights,
+                num_samples=train_len,  # draw one epoch worth of samples
+                replacement=True
+            )
+
+        # else: fallback to standard random shuffle
 
         return DataLoader(self.train_dataset,
                           batch_size=self.batch_size,
@@ -249,10 +282,9 @@ class NuGraphDataModule(LightningDataModule):
         data.add_argument('--limit_val_batches', type=int, default=None,
                           help='Max number of validation batches to be used')
         data.add_argument('--shuffle', type=str, default='balance',
-                          help='Dataset shuffling scheme to use')
+                          help='Dataset shuffling scheme to use: random | balance | weighted')
         data.add_argument('--balance-frac', type=float, default=0.1,
                           help='Fraction of dataset to use for workload balancing')
-        data.add_argument('--min-nu-hits', type=int, default=0,   # NEW
-                          help='Require at least this many ν hits (label index for "nu") '
-                               'per event across U/V/Y; 0 disables the cut.')
+        data.add_argument('--min-nu-hits', type=int, default=0,
+                          help='Require at least this many ν hits per event across U/V/Y; 0 disables the cut.')
         return parser

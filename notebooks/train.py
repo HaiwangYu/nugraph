@@ -100,7 +100,7 @@ def main(args):
         # Try creating WandbLogger on all ranks. It self-gates internally.
         # Check if WANDB_MODE is offline before initializing
         wandb_mode = os.environ.get("WANDB_MODE", "online")
-        logger = WandbLogger(save_dir=logdir, project="nugraph3", name=run_name, log_model="False", offline=(wandb_mode=="offline"))
+        logger = WandbLogger(save_dir=logdir, project="nugraph3", name=run_name, log_model= False, offline=(wandb_mode=="offline"))
         if global_rank == 0: print(f"[Rank 0] WandbLogger initialized (mode: {wandb_mode}).")
     except Exception as e:
         # Fallback to CSVLogger on ALL ranks if W&B fails
@@ -113,7 +113,7 @@ def main(args):
 
     # Add print statement to verify num_workers
     print(f"[Rank {global_rank}] Initializing DataModule with num_workers = {args.num_workers}")
-    nudata = DataModule(model=Model, data_path=args.data_path, num_workers=args.num_workers, batch_size=args.batch_size, min_nu_hits=args.min_nu_hits)
+    nudata = DataModule(model=Model, data_path=args.data_path, num_workers=args.num_workers, batch_size=args.batch_size, min_nu_hits=args.min_nu_hits, shuffle=args.shuffle, balance_frac=args.balance_frac)
 
     # Make dataloading conservative for multi-node HDF5
     for attr, val in [
@@ -277,6 +277,7 @@ def main(args):
         enable_checkpointing=True, # Checkpointing is implicitly handled by callbacks now
         sync_batchnorm=(world_size > 1),
         use_distributed_sampler=True, # Let Lightning handle sampler logic
+        # use_distributed_sampler=False,  # Let *your* DataModule samplers run (balance/weighted)
     )
 
     print(f"[Rank {global_rank}] Starting training...")
@@ -356,5 +357,12 @@ if __name__ == "__main__":
         default=0,
         help="Require at least this many 'nu' hits per event (U+V+Y). 0 disables the cut."
     )
+    p.add_argument(
+        "--shuffle", type=str, default="weighted",
+        choices=["random", "balance", "weighted"],
+        help="Training sampler: random | balance (datasize-based) | weighted (nu-hit aware)."
+    )
+    p.add_argument("--balance-frac", type=float, default=0.10, help="Fraction for BalanceSampler.")
     args = p.parse_args()
+    pl.seed_everything(1337, workers=True)
     main(args)
