@@ -5,7 +5,7 @@ os.environ.setdefault("TORCH_DIST_SKIP_PARAM_VALIDATION", "1")
 os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 # Keep NCCL chatter reasonable (optional)
 # Use TORCH_NCCL_ASYNC_ERROR_HANDLING=1 instead
-# os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
 
 import multiprocessing as mp
 try:
@@ -257,6 +257,8 @@ def main(args):
             **common_kwargs,
             edge_hidden_dim=getattr(args, "edge_hidden_dim", 32),
             embed_dim=getattr(args, "embed_dim", 64),
+            lambda_edge=getattr(args, "lambda_edge", 0.5),
+            edge_pos_weight=getattr(args, "edge_pos_weight", 10.0),
         )
     else:
         nugraph = Model(**common_kwargs)
@@ -342,7 +344,7 @@ def main(args):
         num_sanity_val_steps=0,       # Skip val sanity checks to avoid extra dataloader passes
         strategy=DDPStrategy(
             process_group_backend="nccl",
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             timeout=timedelta(minutes=10),
         ),
         limit_train_batches=1.0,      # Keep this to skip dataloader check during setup
@@ -352,7 +354,8 @@ def main(args):
         max_epochs=args.max_epochs,
         enable_progress_bar=(global_rank == 0),
         enable_checkpointing=True,
-        sync_batchnorm=(world_size > 1),
+        # sync_batchnorm=(world_size > 1),
+        sync_batchnorm=False,
         use_distributed_sampler=True,  # Let Lightning handle sampler logic
         # use_distributed_sampler=False,  # Let *your* DataModule samplers run (balance/weighted)
     )
@@ -450,6 +453,10 @@ if __name__ == "__main__":
                    help="Edge MLP hidden size (NuGraph4).")
     p.add_argument("--embed-dim", type=int, default=64,
                    help="Embedding decoder dim (NuGraph4).")
+    p.add_argument("--lambda-edge", type=float, default=0.5,
+                   help="Weight of the edge loss term in the total loss (NuGraph4).")
+    p.add_argument("--edge-pos-weight", type=float, default=10.0,
+                   help="Positive-class weight for edge BCE loss (nu–nu edges) in NuGraph4.")
 
     # --- Other ---
     p.add_argument("--use-checkpointing", dest="use_checkpointing",

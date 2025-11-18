@@ -1,22 +1,8 @@
-"""
-NuGraph4 model architecture (Incremental refinement of NuGraph3)
-
-Design intent vs NuGraph3:
-  - Learned edge features via a small edge MLP
-  - Embedding-based semantic decoder: x -> embedding -> logits
-
-For this alpha version:
-  - We define these components but KEEP TRAINING BEHAVIOUR IDENTICAL
-    to NuGraph3 by delegating forward() to the parent.
-  - To avoid DDP complaining about "unused parameters", we freeze the
-    new modules' parameters (requires_grad = False), so that DDP does
-    not expect them to participate in the loss.
-"""
-
-from torch import nn
 import torch
+import torch.nn.functional as F
+from torch import nn
 
-from ..nugraph3.nugraph3 import NuGraph3  # reuse encoder/core/Lightning logic
+from ..nugraph3.nugraph3 import NuGraph3  # as before
 
 
 class NuGraph4(NuGraph3):
@@ -25,17 +11,13 @@ class NuGraph4(NuGraph3):
         *args,
         edge_hidden_dim: int = 32,
         embed_dim: int = 64,
+        lambda_edge: float = 0.1,
+        edge_pos_weight: float = 3.0,
         **kwargs,
     ):
-        """
-        NuGraph4 shares the same constructor as NuGraph3, plus:
-
-          edge_hidden_dim : hidden size for the edge MLP
-          embed_dim       : embedding dimension for the node-level decoder
-        """
         super().__init__(*args, **kwargs)
 
-        # --- Edge MLP to learn per-edge weights from (dx,dy,dz,dr,plane,charge_diff,time_diff) ---
+        # --- Edge MLP to learn per-edge logits from 7-D features ---
         in_edge_dim = 7  # [dx, dy, dz, dr, plane_src, charge_diff, time_diff]
         self.edge_mlp = nn.Sequential(
             nn.Linear(in_edge_dim, edge_hidden_dim),
@@ -43,8 +25,7 @@ class NuGraph4(NuGraph3):
             nn.Linear(edge_hidden_dim, 1),
         )
 
-        # --- Embedding-based semantic decoder (not wired into losses yet) ---
-        # Try to infer input/output dims from NuGraph3's semantic_decoder
+        # Embedding-based semantic decoder (we can keep this, even if not heavily used yet)
         in_feat = getattr(self, "hit_features", 256)
         out_feat = len(getattr(self, "semantic_classes", []) or [0, 1])
 
@@ -56,7 +37,6 @@ class NuGraph4(NuGraph3):
                     in_feat = last_fc.in_features
                     out_feat = last_fc.out_features
             except Exception:
-                # Fall back to defaults if inspection fails
                 pass
 
         self.embedding_decoder = nn.Sequential(
@@ -64,36 +44,20 @@ class NuGraph4(NuGraph3):
             nn.LayerNorm(embed_dim),
             nn.GELU(),
         )
-        # New semantic head that operates on the embedding z
         self.semantic_head = nn.Linear(embed_dim, out_feat)
 
-        # ------------------------------------------------------------------
-        # IMPORTANT FOR NOW:
-        # Freeze the new modules so DDP doesn't expect them in the loss.
-        # This keeps behaviour numerically identical to NuGraph3.
-        # ------------------------------------------------------------------
-        for p in self.edge_mlp.parameters():
-            p.requires_grad = False
-        for p in self.embedding_decoder.parameters():
-            p.requires_grad = False
-        for p in self.semantic_head.parameters():
-            p.requires_grad = False
+        # Edge loss hyperparameters
+        self.lambda_edge = lambda_edge
+        self.edge_pos_weight = edge_pos_weight
 
-    # -------------------------------------------------------------------------
-    # Helper for building edge_attr on the fly when encode() does not provide it
-    # (currently UNUSED in training; kept for future integration)
-    # -------------------------------------------------------------------------
-    def _build_edge_attr(self, batch, edge_index):
+    # ------------------------------------------------------------------
+    # Helper: build per-edge features from current batch
+    # ------------------------------------------------------------------
+    def _build_edge_attr(self, h, edge_index):
         """
         Build 7-D edge features per edge:
-
         [dx, dy, dz, dr, plane_src, charge_diff, time_diff]
-
-        For alpha1, only pos + plane are guaranteed to be present.
-        charge_diff and time_diff are filled with zeros if missing.
         """
-        h = batch["hit"]
-
         pos = h.pos  # [N, D]
         plane = getattr(h, "plane", None)
         charge = getattr(h, "q", None)
@@ -104,9 +68,7 @@ class NuGraph4(NuGraph3):
 
         src, dst = edge_index[0], edge_index[1]
 
-        # Geometric differences
         d = pos[dst] - pos[src]  # [E, D]
-        # Ensure 3 components: if D=2, pad a zero dz
         if d.size(1) == 2:
             pad = torch.zeros(d.size(0), 1, device=d.device, dtype=d.dtype)
             d = torch.cat([d, pad], dim=1)
@@ -116,16 +78,13 @@ class NuGraph4(NuGraph3):
         dz = d[:, 2:3]
         dr = torch.linalg.vector_norm(d, ord=2, dim=1, keepdim=True)
 
-        # Plane (source node)
         p_src = plane[src].float().unsqueeze(1)
 
-        # Charge difference (optional)
         if charge is not None:
             qc = (charge[dst] - charge[src]).float().unsqueeze(1)
         else:
             qc = torch.zeros_like(dr)
 
-        # Time difference (optional)
         if time is not None:
             tc = (time[dst] - time[src]).float().unsqueeze(1)
         else:
@@ -134,15 +93,84 @@ class NuGraph4(NuGraph3):
         edge_attr = torch.cat([dx, dy, dz, dr, p_src, qc, tc], dim=1)
         return edge_attr  # [E, 7]
 
-    # -------------------------------------------------------------------------
-    # Forward
-    # -------------------------------------------------------------------------
+    def _edge_logits_and_labels(self, x, edge_index, batch):
+        """
+        Example edge labels:
+        - positive if both endpoints are nu-hits
+        - negative otherwise
+        """
+        h = batch["hit"]
+        y_sem = getattr(h, "y_semantic", None)
+        if y_sem is None:
+            return None, None
+
+        src, dst = edge_index
+        # y=0 -> nu, y=1 -> cosmic (based on your dataset)
+        y_src = y_sem[src]
+        y_dst = y_sem[dst]
+        y_edge = (y_src == 0) & (y_dst == 0)      # both nu
+        y_edge = y_edge.float()                  # [E]
+
+        edge_attr = self._build_edge_attr(h, edge_index)
+        edge_logit = self.edge_mlp(edge_attr).squeeze(-1)  # [E]
+
+        return edge_logit, y_edge
+
+    # ------------------------------------------------------------------
+    # Forward with edge loss augmentation
+    # ------------------------------------------------------------------
     def forward(self, batch, stage=None):
         """
-        Delegate to NuGraph3.forward(batch, stage).
+        Forward pass with edge loss augmentation:
 
-        This preserves the existing training/evaluation API
-        (returns (loss, metrics) for training/validation/test)
-        while NuGraph4 architectural components are being developed.
+        1. Call NuGraph3.forward to compute the usual loss + metrics.
+        2. For 'train' and 'val', compute an edge loss:
+               total_loss = loss_semantic + lambda_edge * loss_edge
+        3. For other stages, leave behavior unchanged.
         """
-        return super().forward(batch, stage)
+        base = super().forward(batch, stage)
+
+        # If parent returns something unexpected, don't break.
+        if not (isinstance(base, tuple) and len(base) == 2):
+            return base
+
+        loss, metrics = base
+
+        if stage not in ("train", "val"):
+            return loss, metrics
+
+        # Node features after encoder/core
+        h = batch["hit"]
+        if not hasattr(h, "x"):
+            return loss, metrics
+        x = h.x
+
+        # Use planar Delaunay edges
+        edge_key = ("hit", "delaunay-planar", "hit")
+        if not hasattr(batch, "edge_index_dict") or edge_key not in batch.edge_index_dict:
+            return loss, metrics
+        edge_index = batch[edge_key].edge_index
+
+        edge_logit, y_edge = self._edge_logits_and_labels(x, edge_index, batch)
+        if edge_logit is None or y_edge is None or y_edge.numel() == 0:
+            return loss, metrics
+
+        pos_w = torch.tensor(self.edge_pos_weight, device=edge_logit.device)
+        edge_loss = F.binary_cross_entropy_with_logits(
+            edge_logit,
+            y_edge,
+            pos_weight=pos_w,
+        )
+
+        total_loss = loss + self.lambda_edge * edge_loss
+
+        # Extend metrics
+        if not isinstance(metrics, dict):
+            metrics = {}
+        else:
+            metrics = dict(metrics)
+
+        metrics["loss/edge"] = edge_loss.detach()
+        metrics["loss/total"] = total_loss.detach()
+
+        return total_loss, metrics

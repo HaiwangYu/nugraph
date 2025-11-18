@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #PBS -N Nugraph_DDP
-#PBS -l select=8:ncpus=32:ngpus=4:mem=128gb
+#PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
 #PBS -l walltime=1:00:00
 #PBS -q debug-scaling
 #PBS -A neutrinoGPU::debug
@@ -20,6 +20,11 @@ module load conda/2024-04-29
 conda activate /lus/eagle/projects/neutrinoGPU/abhat/conda/envs/nugraph-a
 module load cudatoolkit-standalone
 module load libfabric/1.22.0     # cxi provider
+export NUGRAPH_REPO=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph
+export PYTHONPATH="${NUGRAPH_REPO}/nugraph:${NUGRAPH_REPO}:${PYTHONPATH:-}"
+echo "Using NUGRAPH_REPO=${NUGRAPH_REPO}"
+echo "PYTHONPATH=${PYTHONPATH}"
+
 
 # --- aws-ofi-nccl (v1.9.1) and hwloc v2 shim ---
 export AWS_OFI_NCCL=/soft/libraries/aws-ofi-nccl/v1.9.1-aws-libfabric-1.22.0
@@ -137,7 +142,7 @@ echo "PYTHONPATH=${PYTHONPATH:-}"
 
 # --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="nug3_n32_hf256_nf64_it7_lr1e-4_nw0_scw10_ppedges_aw_unified_wts_full"
+RUN_NAME="nug4_edgeloss_lam0p5_pw10_n32_hf256_nf64_it7_scw10_ppedges"
 
 # --- DEFINE THE CHECKPOINT PATH ---
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
@@ -152,6 +157,7 @@ fi
 
 mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
   python -u ./train.py \
+    --model nugraph4 \
     --data-path "${DATA}" \
     --log-dir "${LOGDIR}" \
     --run-name "${RUN_NAME}" \
@@ -165,7 +171,12 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --nexus-features 64 \
     --interaction-features 32 \
     --in-features 8 \
-    --min-nu-hits 50 \
+    --min-nu-hits 0 \
     --shuffle weighted \
     --balance-frac 0.10 \
+    --edge-hidden-dim 32 \
+    --embed-dim 64 \
+    --lambda-edge 0.5 \
+    --edge-pos-weight 10.0 \
+    --batch-size 1 \
     ${CKPT_PATH:+--resume-from "$CKPT_PATH"}
