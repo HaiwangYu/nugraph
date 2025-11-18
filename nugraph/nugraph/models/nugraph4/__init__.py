@@ -1,3 +1,5 @@
-from .nugraph3.nugraph3 import NuGraph3
+# nugraph/nugraph/models/nugraph4/__init__.py
+
 from .nugraph4 import NuGraph4
-__all__ = ["NuGraph3", "NuGraph4"]
+
+__all__ = ["NuGraph4"]

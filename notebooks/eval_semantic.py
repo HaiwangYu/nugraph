@@ -40,18 +40,14 @@ def parse_args():
                         "or restrict to a specific plane.")
     p.add_argument("--nu-class-index", type=int, default=0,
                    help="Index of the 'nu' class inside semantic_classes (default 0).")
+    p.add_argument("--model", default="nugraph3", choices=["nugraph3", "nugraph4"])
     return p.parse_args()
 
 
 def make_datamodule(ng, data_path, model_cls,
                     batch_size=None, num_workers=None,
                     min_nu_hits=None, nu_cut_plane="any", nu_class_index=0):
-    """
-    Recreate exactly what you did in training:
-        Data = ng.data.NuGraphDataModule
-        Model = ng.models.NuGraph3
-        nudata = Data(model=Model, data_path=..., min_nu_hits=..., nu_cut_plane=..., nu_hit_class_index=...)
-    """
+
     Data = ng.data.NuGraphDataModule
     dm = Data(
         model=model_cls,
@@ -237,7 +233,10 @@ def main():
 
     # --- import your project exactly as in training ---
     import nugraph as ng
-    Model = ng.models.NuGraph3
+    if args.model == "nugraph4":
+        Model = ng.models.NuGraph4
+    else:
+        Model = ng.models.NuGraph3
 
     # DataModule exactly as training, now with neutrino-hit cuts forwarded
     dm = make_datamodule(
