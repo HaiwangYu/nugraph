@@ -6,7 +6,7 @@
 #PBS -A neutrinoGPU::debug
 #PBS -l filesystems=home:grand:eagle
 #PBS -j oe
-#PBS -o nugraph_debug_aws_ofi.log
+#PBS -o nugraph_debug_socket.log
 
 set -euo pipefail
 
@@ -14,149 +14,53 @@ cd "${PBS_O_WORKDIR}"
 echo "Starting job in $(pwd)"
 echo "Job running on nodes:"; cat "$PBS_NODEFILE"
 
-# --- Modules/conda ---
 module use /soft/modulefiles
 module load conda/2024-04-29
 conda activate /lus/eagle/projects/neutrinoGPU/abhat/conda/envs/nugraph-a
 module load cudatoolkit-standalone
-module load libfabric/1.22.0     # cxi provider
+module load libfabric/1.22.0
 export NUGRAPH_REPO=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph
 export PYTHONPATH="${NUGRAPH_REPO}/nugraph:${NUGRAPH_REPO}:${PYTHONPATH:-}"
-echo "Using NUGRAPH_REPO=${NUGRAPH_REPO}"
-echo "PYTHONPATH=${PYTHONPATH}"
 
+export MPICH_GPU_SUPPORT_ENABLED=1
+export MPICH_OFI_NIC_POLICY=NUMA
 
-# --- aws-ofi-nccl (v1.9.1) and hwloc v2 shim ---
-export AWS_OFI_NCCL=/soft/libraries/aws-ofi-nccl/v1.9.1-aws-libfabric-1.22.0
-export HWLOC2_SHIM="$HOME/hwloc2-shim"   # contains libhwloc.so.0 -> /usr/lib64/libhwloc.so.15
-
-# Put shim FIRST, then plugin dir
-export LD_LIBRARY_PATH="${HWLOC2_SHIM}:${AWS_OFI_NCCL}/lib:${LD_LIBRARY_PATH:-}"
-export NCCL_PLUGIN_PATH="${AWS_OFI_NCCL}/lib"
-export NCCL_PLUGIN_DISABLE=0
-unset NCCL_NET   # let NCCL auto-detect the OFI plugin
-
-
-# --- Tell Cray MPICH NOT to use its GPU path (we use NCCL instead) ---
-export MPICH_GPU_SUPPORT_ENABLED=0
-export MPICH_OFI_NIC_POLICY=NUMA   # good practice on Polaris; optional but recommended
-
-
-# --- NCCL + Libfabric/CXI on Polaris ---
-export FI_PROVIDER=cxi
-export FI_LOG_LEVEL=info
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=INIT,NET
+# NCCL fallback to sockets
 export NCCL_IB_DISABLE=1
+export NCCL_NET=Socket
+export NCCL_NET_PLUGIN=none
+export NCCL_SOCKET_IFNAME=bond0
 export NCCL_COLLNET_ENABLE=0
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-export NCCL_OFI_LOG_LEVEL=INFO
+export NCCL_DEBUG=INFO
+export NCCL_DEBUG_SUBSYS=INIT,NET
 
-# Loud & clear failures / sync kernels
+export FI_PROVIDER=sockets
+export FI_LOG_LEVEL=info
+
 export PYTHONFAULTHANDLER=1
-# export CUDA_LAUNCH_BLOCKING=1
-# export TORCH_DISTRIBUTED_DEBUG=DETAIL
-
-# Optional: avoid WANDB network during debugging
-# export WANDB_MODE=offline
-
-# --- Misc runtime ---
 export OMP_NUM_THREADS=1
 export HDF5_USE_FILE_LOCKING=FALSE
 
-# --- Rendezvous for torch.distributed ---
 export MASTER_ADDR="$(head -n1 "${PBS_NODEFILE}")"
 export MASTER_PORT="${MASTER_PORT:-29500}"
 
-# --- Dataset path; export so --envall propagates ---
-export DATA="/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d_ppedges.h5"
-ls -lh "$DATA" || { echo "DATA file missing"; exit 1; }
+export DATA=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d_ppedges.h5
+ls -lh "${DATA}" || exit 1
 
-NODES="${PBS_NNODES:-2}"
+NODES="${PBS_NNODES:-4}"
 GPUS_PER_NODE=4
 WORLD_SIZE=$(( NODES * GPUS_PER_NODE ))
 echo "NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
-echo "PYTHONPATH=${PYTHONPATH:-}"
 
-# python - <<'PY'
-# import sys, torch, pytorch_lightning as pl
-# print("PY:", sys.executable)
-# print("Torch", torch.__version__, "CUDA", torch.version.cuda)
-# print("Lightning", pl.__version__)
-# PY
-
-# --- Per-rank env visibility (plugin/shim) ---
-# echo "=== Per-rank NCCL/FI env check ==="
-# mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall bash -lc '
-#   echo "$(hostname) R${PMI_RANK}:"
-#   printf "NCCL_PLUGIN_PATH=%s\n" "${NCCL_PLUGIN_PATH}"
-#   printf "LD_LIBRARY_PATH has plugin? "; echo "${LD_LIBRARY_PATH}" | grep -q "$AWS_OFI_NCCL/lib" && echo YES || echo NO
-#   printf "LD_LIBRARY_PATH has shim?   "; echo "${LD_LIBRARY_PATH}" | grep -q "$HWLOC2_SHIM" && echo YES || echo NO
-#   env | egrep "^(NCCL_|FI_|TORCH_)" | sort
-#   ls -l "${NCCL_PLUGIN_PATH}/libnccl-net.so"
-# '
-# echo "=== end env check ==="
-
-# --- Plugin/Deps resolution check (single node) ---
-# echo "=== Plugin resolution check (ldd) ==="
-# ldd "${AWS_OFI_NCCL}/lib/libnccl-net.so" | egrep 'libnccl|libfabric|hwloc|libcudart' || true
-# echo "=== end resolution check ==="
-
-# --- Multi-rank HDF5 dataset preflight ---
-# echo "=== HDF5 multi-rank open/read sanity ==="
-# cat > preflight_h5.py <<'PY'
-# import os, h5py
-# rank = int(os.environ.get("PMI_RANK","-1"))
-# path = os.environ["DATA"]
-# ok = os.path.exists(path)
-# print(f"[rank {rank}] exists={ok} path={path}", flush=True)
-# if not ok: raise SystemExit(1)
-# with h5py.File(path, "r") as f:
-#     keys = list(f.keys())
-#     print(f"[rank {rank}] root_keys={keys[:3]} (count={len(keys)})", flush=True)
-# print(f"[rank {rank}] HDF5 OK", flush=True)
-# PY
-# mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall python preflight_h5.py
-# echo "=== end HDF5 sanity ==="
-
-# # --- NCCL OFI smoke test (all-reduce) ---
-# echo "=== NCCL OFI smoke test ==="
-# cat > nccl_smoke.py <<'PY'
-# import os, time, torch, torch.distributed as dist
-# os.environ.setdefault("RANK",        os.environ.get("PMI_RANK","0"))
-# os.environ.setdefault("WORLD_SIZE",  os.environ.get("PMI_SIZE","1"))
-# os.environ.setdefault("LOCAL_RANK",  os.environ.get("PMI_LOCAL_RANK","0"))
-# local_rank = int(os.environ["LOCAL_RANK"])
-# torch.cuda.set_device(local_rank)
-# dist.init_process_group(backend="nccl", init_method="env://")
-# x = torch.ones(1, device="cuda")
-# dist.all_reduce(x)
-# dist.barrier()
-# print(f"rank {dist.get_rank()}/{dist.get_world_size()} cuda:{local_rank} -> {x.item()}", flush=True)
-# import time; time.sleep(0.25)
-# dist.destroy_process_group()
-# PY
-# mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall python nccl_smoke.py
-# echo "=== end smoke test ==="
-
-# --- Training (short) ---
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME="nug4_edgeloss_lam0p5_pw10_n32_hf256_nf64_it7_scw10_ppedges"
-
-# --- DEFINE THE CHECKPOINT PATH ---
+RUN_NAME=nug4_edgeloss_lam0p5_pw10_n32_hf256_nf64_it7_scw10_ppedges
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
-echo "Attempting to resume training from: ${CKPT_PATH}"
+[ -f "${CKPT_PATH}" ] || CKPT_PATH=""
 
-
-# Check if the checkpoint file actually exists before trying to resume
-if [ ! -f "${CKPT_PATH}" ]; then
-    echo "WARNING: Checkpoint file not found at ${CKPT_PATH}. Starting a new run."
-    CKPT_PATH="" # <-- SET TO AN EMPTY STRING, NOT "None"
-fi
-
-mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
-  python -u ./train.py \
+mpiexec -n "${WORLD_SIZE}" -ppn "${GPUS_PER_NODE}" --envall \
+  python -u train.py \
     --model nugraph4 \
     --data-path "${DATA}" \
     --log-dir "${LOGDIR}" \
@@ -179,4 +83,4 @@ mpiexec -l -n "${WORLD_SIZE}" --ppn "${GPUS_PER_NODE}" --envall \
     --lambda-edge 0.5 \
     --edge-pos-weight 10.0 \
     --batch-size 1 \
-    ${CKPT_PATH:+--resume-from "$CKPT_PATH"}
+    ${CKPT_PATH:+--resume-from "${CKPT_PATH}"}

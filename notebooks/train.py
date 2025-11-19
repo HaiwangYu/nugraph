@@ -40,6 +40,54 @@ import pytorch_lightning as pl
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import WandbLogger, CSVLogger
 import nugraph as ng
+from pytorch_lightning.plugins.environments import ClusterEnvironment
+
+
+
+class ExternalMPIEnvironment(ClusterEnvironment):
+    def __init__(self) -> None:
+        self._world_size = int(os.environ.get("PMI_SIZE", os.environ.get("WORLD_SIZE", "1")))
+        self._global_rank = int(os.environ.get("PMI_RANK", os.environ.get("RANK", "0")))
+        self._main_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        self._main_port = int(os.environ.get("MASTER_PORT", "29500"))
+
+    @property
+    def creates_processes_externally(self) -> bool:
+        return True
+
+    @property
+    def main_address(self) -> str:
+        return self._main_addr
+
+    @property
+    def main_port(self) -> int:
+        return self._main_port
+
+    @staticmethod
+    def detect() -> bool:
+        return True
+
+    def world_size(self) -> int:
+        return self._world_size
+
+    def set_world_size(self, size: int) -> None:
+        return  # Lightning shouldn’t override MPI’s size
+
+    def global_rank(self) -> int:
+        return self._global_rank
+
+    def set_global_rank(self, rank: int) -> None:
+        return
+
+    def local_rank(self) -> int:
+        return int(os.environ.get("PMI_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")))
+    
+    def node_rank(self) -> int:
+        return int(os.environ.get("PMI_NODE_RANK", os.environ.get("NODE_RANK", "0")))
+
+
+
+
 
 
 def get_last_linear(module: nn.Module) -> nn.Linear:
@@ -86,7 +134,16 @@ def main(args):
     # Ranks from mpiexec / Cray MPICH
     global_rank = int(os.environ.get("PMI_RANK", os.environ.get("RANK", "0")))
     world_size  = int(os.environ.get("PMI_SIZE", os.environ.get("WORLD_SIZE", "1")))
-    local_rank  = int(os.environ.get("PMI_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")))
+    local_rank = int(os.environ.get("PMI_LOCAL_RANK", os.environ.get("LOCAL_RANK", "0")))
+    devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if devices:
+        logical = [d.strip() for d in devices.split(",")]
+        os.environ["CUDA_VISIBLE_DEVICES"] = logical[local_rank % len(logical)]
+        torch.cuda.set_device(0)
+    else:
+        torch.cuda.set_device(local_rank % torch.cuda.device_count())
+
+
     print(f"[Rank {global_rank}] MPI/Env: WORLD_SIZE={world_size}, RANK={global_rank}, LOCAL_RANK={local_rank}")
 
     # Make sure Lightning also sees torchrun-style env
@@ -329,36 +386,70 @@ def main(args):
         ),
     ]
 
-    # --- Trainer ---
-    num_nodes_calc = max(1, world_size // max(1, args.gpus_per_node))
-    per_node_gpus = args.gpus_per_node if torch.cuda.is_available() else 0
-    print(
-        f"[Rank {global_rank}] Setting up Trainer "
-        f"(num_nodes={num_nodes_calc}, per_node_gpus={per_node_gpus}, world_size={world_size})..."
-    )
 
-    trainer = pl.Trainer(
-        accelerator="gpu" if torch.cuda.is_available() else "cpu",
-        devices=args.gpus_per_node,   # Total devices per node Lightning should manage
-        num_nodes=num_nodes_calc,     # Total nodes
-        num_sanity_val_steps=0,       # Skip val sanity checks to avoid extra dataloader passes
-        strategy=DDPStrategy(
+    # --- Trainer configuration ---
+    use_gpu = torch.cuda.is_available()
+
+    if world_size > 1:
+        # Launched by mpiexec: one MPI rank == one GPU.
+        accelerator = "gpu" if use_gpu else "cpu"
+        ranks_per_node = int(os.environ.get("PMI_LOCAL_SIZE", os.environ.get("LOCAL_WORLD_SIZE", "1")))
+        ranks_per_node = max(1, ranks_per_node)
+
+        devices = ranks_per_node if use_gpu else 0        # IMPORTANT: 1 GPU per MPI process
+        num_nodes = max(1, world_size // ranks_per_node)       # Lightning sees this as a "single node"; MPI spans nodes
+
+        print(
+            f"[Rank {global_rank}] Setting up DDP Trainer with external MPI "
+            f"(world_size={world_size}, devices={devices}, num_nodes={num_nodes})"
+        )
+
+        strategy = DDPStrategy(
             process_group_backend="nccl",
             find_unused_parameters=True,
             timeout=timedelta(minutes=10),
-        ),
-        limit_train_batches=1.0,      # Keep this to skip dataloader check during setup
+            cluster_environment=ExternalMPIEnvironment(),  # <-- key line
+        )
+    else:
+        # Single-process (no mpiexec): you can still run multi-GPU here if you want
+        accelerator = "gpu" if use_gpu else "cpu"
+        if use_gpu:
+            devices = min(args.gpus_per_node, torch.cuda.device_count())
+        else:
+            devices = 0
+        num_nodes = 1
+        strategy = "auto"
+
+        print(
+            f"[Rank {global_rank}] Setting up single-process Trainer "
+            f"(devices={devices}, num_nodes={num_nodes})"
+        )
+
+    trainer = pl.Trainer(
+        accelerator=accelerator,
+        devices=devices,
+        num_nodes=num_nodes,
+        strategy=strategy,
+        num_sanity_val_steps=0,
+        # plugins=[ExternalMPIEnvironment()],
+
+        # let your CLI flags control these if you have them;
+        # otherwise they default to 1.0 (full epoch)
+        limit_train_batches=getattr(args, "limit_train_batches", 1.0),
+        limit_val_batches=getattr(args, "limit_val_batches", 1.0),
+        limit_test_batches=getattr(args, "limit_test_batches", 1.0),
+
         logger=logger,
         callbacks=callbacks,
         precision="32-true",
         max_epochs=args.max_epochs,
         enable_progress_bar=(global_rank == 0),
         enable_checkpointing=True,
-        # sync_batchnorm=(world_size > 1),
         sync_batchnorm=False,
-        use_distributed_sampler=True,  # Let Lightning handle sampler logic
-        # use_distributed_sampler=False,  # Let *your* DataModule samplers run (balance/weighted)
+        use_distributed_sampler=True,
     )
+
+
 
     print(f"[Rank {global_rank}] Starting training...")
     ckpt_path = args.resume_from
@@ -480,6 +571,25 @@ if __name__ == "__main__":
     )
     p.add_argument("--balance-frac", type=float, default=0.10,
                    help="Fraction for BalanceSampler.")
+    
+    p.add_argument(
+        "--limit-train-batches",
+        type=float,
+        default=1.0,
+        help="Fraction or number of train batches per epoch (Lightning semantics).",
+    )
+    p.add_argument(
+        "--limit-val-batches",
+        type=float,
+        default=1.0,
+        help="Fraction or number of val batches per epoch.",
+    )
+    p.add_argument(
+        "--limit-test-batches",
+        type=float,
+        default=1.0,
+        help="Fraction or number of test batches.",
+    )
 
     args = p.parse_args()
     pl.seed_everything(1337, workers=True)
