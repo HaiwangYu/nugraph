@@ -139,7 +139,7 @@ class WCMLConverter:
     # Core conversion logic
     # ------------------------------------------------------------------
     def _build_graph(self, sample_name: str, arrays: WCMLArrays) -> NuGraphData:
-        charges, centroids, corners = self._extract_blobs(arrays.blobs)
+        charges, centroids, corners, cluster_by_blob = self._extract_blobs(arrays.blobs, arrays.points)
         semantic = self._label_blobs(arrays.points, arrays.is_nu, len(corners), self.config)
         encoded_semantic = self._encode_semantic_labels(semantic)
 
@@ -166,7 +166,9 @@ class WCMLConverter:
         graph["metadata"].event = event
 
         graph["sp"].pos = torch.as_tensor(centroids, dtype=torch.float32)
-        graph["sp"].q = torch.as_tensor(charges, dtype=torch.float32)
+        graph["sp"].features = torch.as_tensor(np.stack([charges, 
+                                                         cluster_by_blob.astype(np.float32)], axis=1),
+                                               dtype=torch.float32)
         graph["sp"].y_semantic = torch.as_tensor(encoded_semantic, dtype=torch.long)
 
         blob_pairs, blob_edges = self._ppedges_to_blobedges(arrays.ppedges,arrays.points)
@@ -211,7 +213,15 @@ class WCMLConverter:
 
         return graph
 
-    def _extract_blobs(self, raw_blobs: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[np.ndarray]]:
+    def _extract_blobs(self, raw_blobs: np.ndarray, points: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, list[np.ndarray], np.ndarray]:
+        """Extract blob charges, centroids, corners and aggregate cluster indices.
+
+        Returns:
+            charges: (N,) float32
+            centroids: (N,3) float32
+            corners: list of (M_i,3) arrays
+            cluster_by_blob: (N,) int64 array with cluster_idx or -1
+        """
         charges = raw_blobs[:, 0]
         corner_counts = raw_blobs[:, 1].astype(int)
         corners: list[np.ndarray] = []
@@ -222,7 +232,26 @@ class WCMLConverter:
             coords = raw_blobs[idx, offset:end].reshape(count, 3)
             corners.append(coords)
             centroids.append(coords.mean(axis=0))
-        return charges.astype(np.float32), np.asarray(centroids, dtype=np.float32), corners
+
+        n_blobs = len(centroids)
+        cluster_by_blob = np.full(n_blobs, -1, dtype=np.int64)
+        if points is not None and points.size and points.ndim == 2 and points.shape[1] >= 6:
+            blob_idx    = points[:, 4].astype(np.int64)
+            cluster_idx = points[:, 5].astype(np.int64)
+            for blob_id in range(n_blobs):
+                mask = blob_idx == blob_id
+                if not mask.any():
+                    continue
+                vals = cluster_idx[mask]
+                unique_vals = np.unique(vals)
+                if unique_vals.size == 1:
+                    cluster_by_blob[blob_id] = int(unique_vals[0])
+                else:
+                    # multiple cluster indices for one blob -> warn and use fallback -1
+                    print(f"[warn] blob {blob_id} has multiple cluster_idx values {unique_vals.tolist()}; using fallback -1")
+                    cluster_by_blob[blob_id] = -1
+
+        return charges.astype(np.float32), np.asarray(centroids, dtype=np.float32), corners, cluster_by_blob
 
     def _label_blobs(self,
                      points: np.ndarray,
