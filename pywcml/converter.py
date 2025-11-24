@@ -167,7 +167,7 @@ class WCMLConverter:
 
         graph["sp"].pos = torch.as_tensor(centroids, dtype=torch.float32)
         graph["sp"].features = torch.as_tensor(np.stack([charges, 
-                                                         cluster_by_blob.astype(np.float32)], axis=1),
+                                                         cluster_by_blob], axis=1),
                                                dtype=torch.float32)
         graph["sp"].y_semantic = torch.as_tensor(encoded_semantic, dtype=torch.long)
 
@@ -234,22 +234,12 @@ class WCMLConverter:
             centroids.append(coords.mean(axis=0))
 
         n_blobs = len(centroids)
-        cluster_by_blob = np.full(n_blobs, -1, dtype=np.int64)
-        if points is not None and points.size and points.ndim == 2 and points.shape[1] >= 6:
-            blob_idx    = points[:, 4].astype(np.int64)
-            cluster_idx = points[:, 5].astype(np.int64)
-            for blob_id in range(n_blobs):
-                mask = blob_idx == blob_id
-                if not mask.any():
-                    continue
-                vals = cluster_idx[mask]
-                unique_vals = np.unique(vals)
-                if unique_vals.size == 1:
-                    cluster_by_blob[blob_id] = int(unique_vals[0])
-                else:
-                    # multiple cluster indices for one blob -> warn and use fallback -1
-                    print(f"[warn] blob {blob_id} has multiple cluster_idx values {unique_vals.tolist()}; using fallback -1")
-                    cluster_by_blob[blob_id] = -1
+        cluster_by_blob = np.full(n_blobs, -1.0,dtype=np.float32)
+        pairs = np.unique(points[:,-2:],axis=0)
+        if len(pairs) != n_blobs:
+            print(f"nblobs is {n_blobs} but unique pairs between blob/cluster_idx is {len(pairs)}. Returning -1 for all blobs")
+        else: 
+            cluster_by_blob = pairs[:,-1]
 
         return charges.astype(np.float32), np.asarray(centroids, dtype=np.float32), corners, cluster_by_blob
 
