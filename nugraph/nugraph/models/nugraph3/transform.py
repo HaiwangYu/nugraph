@@ -54,6 +54,8 @@ class Transform(BaseTransform):
 
             # add true instance nodes
             if hasattr(data["hit"], "y_instance"):
+                # Preserve labels for downstream consumers (e.g., edge loss).
+                data["hit"].pid = data["hit"].y_instance.clone()
                 y = data["hit"].y_instance
                 mask = y != -1
                 y = y[mask]
@@ -67,7 +69,7 @@ class Transform(BaseTransform):
                 data["particle-truth"].x = torch.empty(instances.size(0), 0)
                 edges = torch.stack((mask.nonzero().squeeze(1), y), dim=0).long()
                 data["hit", "cluster-truth", "particle-truth"].edge_index = edges
-                del data["hit"].y_instance
+                # Keep y_instance for diagnostics; models can read pid or y_instance.
 
             # add edges to and from event node
             data["evt"].x = torch.empty((1, 0))

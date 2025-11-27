@@ -316,6 +316,7 @@ def main(args):
             embed_dim=getattr(args, "embed_dim", 64),
             lambda_edge=getattr(args, "lambda_edge", 0.5),
             edge_pos_weight=getattr(args, "edge_pos_weight", 10.0),
+            lambda_embed=getattr(args, "lambda_embed", 0.2),
         )
     else:
         nugraph = Model(**common_kwargs)
@@ -539,15 +540,18 @@ if __name__ == "__main__":
     p.add_argument("--instance-head", action="store_true", default=False,
                    help="Enable instance clustering head.")
 
-    # --- NuGraph4-only hyperparams (ignored for NuGraph3) ---
+    # --- NuGraph4-specific ---
     p.add_argument("--edge-hidden-dim", type=int, default=32,
-                   help="Edge MLP hidden size (NuGraph4).")
+                help="Edge MLP hidden size (NuGraph4).")
     p.add_argument("--embed-dim", type=int, default=64,
-                   help="Embedding decoder dim (NuGraph4).")
-    p.add_argument("--lambda-edge", type=float, default=0.5,
-                   help="Weight of the edge loss term in the total loss (NuGraph4).")
-    p.add_argument("--edge-pos-weight", type=float, default=10.0,
-                   help="Positive-class weight for edge BCE loss (nu–nu edges) in NuGraph4.")
+                help="Embedding decoder dim (NuGraph4).")
+    p.add_argument("--lambda-edge", type=float, default=0.0,
+                help="Weight of the edge loss term in the total loss (NuGraph4).")
+    p.add_argument("--edge-pos-weight", type=float, default=1.0,
+                help="Positive-class weight for edge BCE loss (nu–nu edges) in NuGraph4.")
+    p.add_argument("--lambda-embed", type=float, default=0.2,
+                help="Weight of instance embedding loss (NuGraph4).")
+
 
     # --- Other ---
     p.add_argument("--use-checkpointing", dest="use_checkpointing",

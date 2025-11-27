@@ -1,8 +1,8 @@
 #!/bin/bash -l
 #PBS -N Nugraph_DDP
-#PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
+#PBS -l select=2:ncpus=32:ngpus=4:mem=128gb
 #PBS -l walltime=1:00:00
-#PBS -q debug-scaling
+#PBS -q debug
 #PBS -A neutrinoGPU::debug
 #PBS -l filesystems=home:grand:eagle
 #PBS -j oe
@@ -44,7 +44,7 @@ export PYTHONFAULTHANDLER=1
 export OMP_NUM_THREADS=1
 export HDF5_USE_FILE_LOCKING=FALSE
 
-export DATA=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d_ppedges.h5
+export DATA=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/23334072_3d_ppedges_clusterid_instance.h5
 ls -lh "${DATA}" || exit 1
 
 # Build a unique hostfile so mpiexec really launches 4 ranks per node
@@ -63,7 +63,7 @@ echo "NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME=nug4_edgeloss_lam0p5_pw10_n32_hf256_nf64_it7_scw10_ppedges
+RUN_NAME=nug4_instV2_EDGE_lamE0p05_lamZ0p05_bs8_n32_hf256_nf64_it7_scw10_ppedges
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
 [ -f "${CKPT_PATH}" ] || CKPT_PATH=""
 
@@ -88,9 +88,10 @@ mpiexec -hostfile "${HOSTFILE}" -n "${WORLD_SIZE}" -ppn "${GPUS_PER_NODE}" --env
     --balance-frac 0.10 \
     --edge-hidden-dim 32 \
     --embed-dim 64 \
-    --lambda-edge 0.5 \
-    --edge-pos-weight 10.0 \
-    --batch-size 32 \
+    --lambda-edge 0.05 \
+    --edge-pos-weight 1.0 \
+    --lambda-embed 0.05 \
+    --batch-size 8 \
     ${CKPT_PATH:+--resume-from "${CKPT_PATH}"}
 
 # Optional: keep the hostfile for debugging; otherwise uncomment the next line
