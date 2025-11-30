@@ -14,6 +14,9 @@ class NuGraph4(NuGraph3):
         lambda_edge: float = 0.0,     # default off for v1
         edge_pos_weight: float = 0.3,
         lambda_embed: float = 0.2,    # NEW: weight for instance embedding loss
+        lambda_coh: float = 0.0,      # NEW: cluster coherence loss weight
+        coh_edge_thr: float = 0.7,    # threshold for p_same when forming clusters
+        coh_min_cluster: int = 2,     # min cluster size for coherence loss
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -52,6 +55,9 @@ class NuGraph4(NuGraph3):
         self.lambda_edge = lambda_edge       # edge BCE (kept for later phases)
         self.edge_pos_weight = edge_pos_weight
         self.lambda_embed = lambda_embed     # instance embedding loss
+        self.lambda_coh = lambda_coh         # semantic coherence loss
+        self.coh_edge_thr = coh_edge_thr
+        self.coh_min_cluster = coh_min_cluster
 
         # Internal flags for one-time logging (edge + embed)
         self._edge_stats_logged = False
@@ -64,6 +70,11 @@ class NuGraph4(NuGraph3):
         self._warmup_phase_logged_embed = False
         self._rampup_phase_logged_embed = False
         self._full_phase_logged_embed = False
+
+        self._coh_phase_logged_warmup = False
+        self._coh_phase_logged_rampup = False
+        self._coh_phase_logged_full = False
+
 
     # ----------------------------------------------------------------------
     # Helper: rank-0 check to avoid DDP spam
@@ -209,6 +220,92 @@ class NuGraph4(NuGraph3):
         edge_logit = self.edge_mlp(edge_attr).squeeze(-1)
 
         return edge_logit, y_edge, edge_index_valid
+
+    # ----------------------------------------------------------------------
+    # NEW: build clusters from high-confidence edge probabilities
+    # ----------------------------------------------------------------------
+    def _build_clusters_from_edges(
+        self,
+        edge_probs: torch.Tensor,
+        edge_index_valid: torch.Tensor,
+        batch_idx: torch.Tensor,
+        pid: torch.Tensor,
+        edge_thr: float,
+        min_cluster_size: int,
+    ):
+        """
+        Build per-graph clusters using edges with p_same >= edge_thr.
+        Only labeled hits (pid >= 0) are considered.
+        Returns a list of 1D LongTensors of global hit indices (one per cluster).
+        """
+        keep = edge_probs >= edge_thr
+        if keep.sum() == 0:
+            return []
+
+        ei = edge_index_valid[:, keep]
+        src, dst = ei
+
+        # Only consider labeled hits
+        labeled = pid >= 0
+
+        clusters = []
+        for g in batch_idx.unique():
+            g = int(g.item())
+            node_mask = (batch_idx == g) & labeled
+            if node_mask.sum() < min_cluster_size:
+                continue
+            idx_g = node_mask.nonzero(as_tuple=False).view(-1)
+            # Map global -> local
+            global_to_local = {int(gi): li for li, gi in enumerate(idx_g.tolist())}
+
+            # Edges inside this graph with labeled endpoints
+            edge_mask_g = (
+                (batch_idx[src] == g)
+                & (batch_idx[dst] == g)
+                & labeled[src]
+                & labeled[dst]
+            )
+            if edge_mask_g.sum() == 0:
+                continue
+
+            src_g = src[edge_mask_g].tolist()
+            dst_g = dst[edge_mask_g].tolist()
+
+            # Union-find
+            parent = list(range(idx_g.numel()))
+            size = [1] * idx_g.numel()
+
+            def find(x: int) -> int:
+                while parent[x] != x:
+                    parent[x] = parent[parent[x]]
+                    x = parent[x]
+                return x
+
+            def union(a: int, b: int):
+                ra, rb = find(a), find(b)
+                if ra == rb:
+                    return
+                if size[ra] < size[rb]:
+                    ra, rb = rb, ra
+                parent[rb] = ra
+                size[ra] += size[rb]
+
+            for s, d in zip(src_g, dst_g):
+                if s in global_to_local and d in global_to_local:
+                    union(global_to_local[s], global_to_local[d])
+
+            # Collect clusters
+            root_to_nodes = {}
+            for gi in idx_g.tolist():
+                li = global_to_local[gi]
+                r = find(li)
+                root_to_nodes.setdefault(r, []).append(gi)
+
+            for nodes in root_to_nodes.values():
+                if len(nodes) >= min_cluster_size:
+                    clusters.append(torch.tensor(nodes, device=pid.device, dtype=torch.long))
+
+        return clusters
 
     # ----------------------------------------------------------------------
     # NEW: instance embedding contrastive loss
@@ -397,8 +494,13 @@ class NuGraph4(NuGraph3):
         edge_loss = None
         edge_weight = 0.0
         edge_logit = None
+        edge_index_valid = None
+        edge_probs = None
 
-        if self.lambda_edge > 0.0:
+        # We may need edge logits/probs for edge loss and/or coherence loss
+        need_edges = (self.lambda_edge > 0.0) or (self.lambda_coh > 0.0)
+
+        if need_edges:
             edge_key = ("hit", "delaunay-planar", "hit")
             if hasattr(batch, "edge_index_dict") and edge_key in batch.edge_index_dict:
                 edge_index = batch[edge_key].edge_index
@@ -406,7 +508,15 @@ class NuGraph4(NuGraph3):
                     x, edge_index, batch
                 )
 
-                if edge_logit is not None and y_edge is not None and y_edge.numel() > 0:
+                if edge_logit is not None and edge_index_valid is not None:
+                    edge_probs = torch.sigmoid(edge_logit)
+
+                if (
+                    self.lambda_edge > 0.0
+                    and edge_logit is not None
+                    and y_edge is not None
+                    and y_edge.numel() > 0
+                ):
                     # Always stash logits + the VALID edge_index for evaluation (all stages)
                     h.edge_logits = edge_logit.detach()
                     h.edge_index = edge_index_valid
@@ -479,6 +589,92 @@ class NuGraph4(NuGraph3):
             metrics["loss/edge_weight"] = torch.tensor(
                 edge_weight, device=x.device
             )
+
+        # ------------------------------------------------------------------
+        # 3) Coherence loss: make semantic logits consistent within clusters
+        # ------------------------------------------------------------------
+        coh_loss = None
+        coh_weight = 0.0
+        if (
+            self.lambda_coh > 0.0
+            and edge_probs is not None
+            and edge_index_valid is not None
+            and hasattr(h, "x_semantic")
+        ):
+            # Build clusters per graph from high-confidence edges
+            batch_idx = getattr(h, "batch", None)
+            if batch_idx is None:
+                batch_idx = torch.zeros(h.x.size(0), dtype=torch.long, device=h.x.device)
+
+            pid = getattr(h, "pid", None)
+            if pid is None:
+                pid = getattr(h, "y_instance", None)
+
+            if pid is not None:
+                clusters = self._build_clusters_from_edges(
+                    edge_probs=edge_probs,
+                    edge_index_valid=edge_index_valid,
+                    batch_idx=batch_idx,
+                    pid=pid,
+                    edge_thr=self.coh_edge_thr,
+                    min_cluster_size=self.coh_min_cluster,
+                )
+                if clusters:
+                    # Use semantic logits/probabilities; coherence is variance within cluster
+                    s = h.x_semantic  # [N, C] (softmaxed)
+                    losses = []
+                    for idx in clusters:
+                        # Avoid CPU transfers; idx lives on device
+                        s_c = s[idx]
+                        if s_c.size(0) < 2:
+                            continue
+                        mean_c = s_c.mean(dim=0, keepdim=True)
+                        losses.append(((s_c - mean_c) ** 2).mean())
+                    if losses:
+                        coh_loss = torch.stack(losses).mean()
+
+            if stage in ("train", "val") and coh_loss is not None:
+                try:
+                    current_epoch = self.trainer.current_epoch
+                except (AttributeError, RuntimeError):
+                    current_epoch = 0
+
+                WARMUP_EPOCHS = 10
+                RAMPUP_EPOCHS = 10
+
+                if current_epoch < WARMUP_EPOCHS:
+                    coh_weight = 0.0
+                    if self._is_rank0() and not self._coh_phase_logged_warmup:
+                        print(
+                            f"\n[COH WARM-UP] Epochs 0-{WARMUP_EPOCHS-1}: "
+                            f"Coherence loss DISABLED"
+                        )
+                        self._coh_phase_logged_warmup = True
+                elif current_epoch < WARMUP_EPOCHS + RAMPUP_EPOCHS:
+                    ramp_progress = (current_epoch - WARMUP_EPOCHS) / RAMPUP_EPOCHS
+                    coh_weight = self.lambda_coh * ramp_progress
+                    if self._is_rank0() and not self._coh_phase_logged_rampup:
+                        print(
+                            f"\n[COH RAMP-UP] Epochs {WARMUP_EPOCHS}-"
+                            f"{WARMUP_EPOCHS+RAMPUP_EPOCHS-1}: "
+                            f"Coherence loss ramping from 0 to {self.lambda_coh}"
+                        )
+                        self._coh_phase_logged_rampup = True
+                else:
+                    coh_weight = self.lambda_coh
+                    if self._is_rank0() and not self._coh_phase_logged_full:
+                        print(
+                            f"\n[COH FULL] Epoch {WARMUP_EPOCHS+RAMPUP_EPOCHS}+: "
+                            f"Full coherence loss (λ_coh={self.lambda_coh})"
+                        )
+                        self._coh_phase_logged_full = True
+
+                coh_weight = max(0.0, min(self.lambda_coh, float(coh_weight)))
+                total_loss = total_loss + coh_weight * coh_loss
+
+        if coh_loss is not None and self.lambda_coh > 0.0:
+            metrics["loss/coh"] = coh_loss.detach()
+            metrics["loss/coh_weight"] = torch.tensor(coh_weight, device=x.device)
 
         metrics["loss/total"] = total_loss.detach()
 

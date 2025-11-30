@@ -31,8 +31,21 @@ class PositionFeatures(BaseTransform):
         else:
             node_types = self.planes
 
-        # concatenate position tensor onto node features
         for node_type in node_types:
             n = data[node_type]
+
+            # --- NEW: if we're on the merged hit store and still only have
+            #     the old 5 features, pad with 2 zeros to reach 7,
+            #     so that after adding pos (3) we get 10 total.
+            if node_type == "hit" and n.x.size(-1) == 5:
+                extra = torch.zeros(
+                    (n.x.size(0), 2),
+                    dtype=n.x.dtype,
+                    device=n.x.device,
+                )
+                n.x = torch.cat((n.x, extra), dim=-1)
+
+            # concatenate position tensor onto node features
             n.x = torch.cat((n.pos, n.x), dim=-1)
+
         return data

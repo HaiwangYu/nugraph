@@ -317,6 +317,9 @@ def main(args):
             lambda_edge=getattr(args, "lambda_edge", 0.5),
             edge_pos_weight=getattr(args, "edge_pos_weight", 10.0),
             lambda_embed=getattr(args, "lambda_embed", 0.2),
+            lambda_coh=getattr(args, "lambda_coh", 0.0),
+            coh_edge_thr=getattr(args, "coh_edge_thr", 0.7),
+            coh_min_cluster=getattr(args, "coh_min_cluster", 2),
         )
     else:
         nugraph = Model(**common_kwargs)
@@ -551,6 +554,12 @@ if __name__ == "__main__":
                 help="Positive-class weight for edge BCE loss (nu–nu edges) in NuGraph4.")
     p.add_argument("--lambda-embed", type=float, default=0.2,
                 help="Weight of instance embedding loss (NuGraph4).")
+    p.add_argument("--lambda-coh", type=float, default=0.0,
+                 help="Weight of semantic coherence loss over predicted clusters (NuGraph4).")
+    p.add_argument("--coh-edge-thr", type=float, default=0.7,
+                 help="p_same threshold for building clusters used in coherence loss.")
+    p.add_argument("--coh-min-cluster", type=int, default=2,
+                 help="Minimum cluster size for coherence loss.")
 
 
     # --- Other ---

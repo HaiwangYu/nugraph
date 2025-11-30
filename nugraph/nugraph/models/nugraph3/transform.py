@@ -3,6 +3,7 @@ import torch
 from torch_geometric.transforms import BaseTransform
 from pynuml.data import NuGraphData
 
+
 class Transform(BaseTransform):
     """
     NuGraph3 data transform
@@ -92,6 +93,15 @@ class Transform(BaseTransform):
 
         # concatenate position tensor onto node features
         h = data["hit"]
+
+        # Pad feature dimension so pos_dim + feat_dim reaches 10 when needed.
+        target_total = 10
+        pos_dim = h.pos.size(-1)
+        need = target_total - pos_dim - h.x.size(-1)
+        if need > 0:
+            pad = torch.zeros((h.x.size(0), need), dtype=h.x.dtype, device=h.x.device)
+            h.x = torch.cat((h.x, pad), dim=-1)
+
         h.x = torch.cat((h.pos, h.x), dim=-1)
 
         return data
