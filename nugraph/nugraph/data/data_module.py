@@ -26,7 +26,8 @@ class NuGraphDataModule(LightningDataModule):
                  num_workers: int = 5,
                  shuffle: str = 'random',
                  balance_frac: float = 0.1,
-                 min_nu_hits: int = 0  # neutrino-hit cut (0 = no cut)
+                 min_nu_hits: int = 0,
+                 train_fraction: float = 1.0,
                  ):
         super().__init__()
 
@@ -36,6 +37,8 @@ class NuGraphDataModule(LightningDataModule):
 
         if data_path == "auto":
             data_path = DEFAULT_DATA
+
+        self.train_fraction = float(train_fraction)
         self.filename = os.path.expandvars(data_path)
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -95,6 +98,30 @@ class NuGraphDataModule(LightningDataModule):
                 print(("Data size array not found in file! "
                        "Call \"generate_samples\" to create it."))
                 sys.exit()
+
+
+            # --- NEW: apply train_fraction sub-sampling BEFORE min_nu_hits filtering ---
+            if 0.0 < self.train_fraction < 1.0:
+                import numpy as _np
+                rng = _np.random.default_rng(1337)  # fixed seed for reproducibility
+
+                train_samples_np = _np.asarray(train_samples)
+                n_total = len(train_samples_np)
+                n_keep = max(1, int(round(self.train_fraction * n_total)))
+
+                idx = rng.choice(n_total, size=n_keep, replace=False)
+                idx.sort()
+
+                print(f"[Data] train_fraction={self.train_fraction:.2f}: "
+                      f"train {n_total} -> {n_keep} samples")
+
+                train_samples = train_samples_np[idx]
+
+                if len(self.train_datasize) == n_total:
+                    self.train_datasize = self.train_datasize[idx]
+                else:
+                    print("[Data] Warning: datasize/train length mismatch; "
+                          "BalanceSampler may not match exactly.")
 
             # -------- neutrino-hit helpers (used by filtering and weighting) --------
             try:

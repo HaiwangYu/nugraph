@@ -219,7 +219,8 @@ def main(args):
         batch_size=args.batch_size,
         min_nu_hits=args.min_nu_hits,
         shuffle=args.shuffle,
-        balance_frac=args.balance_frac
+        balance_frac=args.balance_frac,
+        train_fraction=getattr(args, "train_fraction", 1.0),
     )
 
     # Make dataloading conservative for multi-node HDF5
@@ -602,6 +603,12 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Fraction or number of test batches.",
+    )
+    p.add_argument(
+        "--train-fraction",
+        type=float,
+        default=1.0,
+        help="Fraction of the train split to use (0 < f <= 1.0).",
     )
 
     args = p.parse_args()

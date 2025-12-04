@@ -1,8 +1,8 @@
 #!/bin/bash -l
 #PBS -N Nugraph_DDP
-#PBS -l select=2:ncpus=32:ngpus=4:mem=128gb
+#PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
 #PBS -l walltime=1:00:00
-#PBS -q debug
+#PBS -q preemptable
 #PBS -A neutrinoGPU::debug
 #PBS -l filesystems=home:grand:eagle
 #PBS -j oe
@@ -63,7 +63,7 @@ echo "NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME=nug4_instV4_vertex10D_fresh
+RUN_NAME=nug4_semanticonly_frac0p7
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
 [ -f "${CKPT_PATH}" ] || CKPT_PATH=""
 
@@ -90,11 +90,12 @@ mpiexec -hostfile "${HOSTFILE}" -n "${WORLD_SIZE}" -ppn "${GPUS_PER_NODE}" --env
     --embed-dim 64 \
     --lambda-edge 0.0 \
     --edge-pos-weight 1.0 \
-    --lambda-embed 0.05 \
+    --lambda-embed 0.0 \
     --lambda-coh 0.0 \
     --coh-edge-thr 0.7 \
     --coh-min-cluster 2 \
     --batch-size 8 \
+    --train-fraction 0.7 \
     ${CKPT_PATH:+--resume-from "${CKPT_PATH}"}
 
 # Optional: keep the hostfile for debugging; otherwise uncomment the next line
