@@ -1,3 +1,4 @@
+# filename: nugraph/models/nugraph4.py
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -19,10 +20,35 @@ class NuGraph4(NuGraph3):
         coh_min_cluster: int = 2,     # min cluster size for coherence loss
         **kwargs,
     ):
+        """
+        NuGraph4 extends NuGraph3 by:
+          - replacing the original semantic decoder with an embedding-based head
+          - adding edge MLP + edge loss (optional)
+          - adding instance embedding loss + coherence loss (optional)
+
+        IMPORTANT for sidecar features:
+        --------------------------------
+        The new semantic sidecar features are appended to hit.x in
+        NuGraphDataset, then PositionFeatures concatenates pos → final
+        per-hit input dimension = `in_features` (CLI arg).
+
+        NuGraph3’s encoder uses `in_features` to map those raw channels
+        to `hit_features` (the learned embedding dim).
+
+        Here, `in_feat = self.hit_features` is that embedding dim, so
+        NuGraph4 automatically “sees” the sidecar features through x.
+        No extra plumbing is needed here.
+        """
         super().__init__(*args, **kwargs)
 
-        # Hit embedding dimension from the encoder/core
+        # Hit embedding dimension from the encoder/core (NOT raw input channels)
         in_feat = getattr(self, "hit_features", 256)
+
+        # Optional one-time debug: confirm we’re using the expected embedding dim
+        if not hasattr(self, "_nug4_init_logged"):
+            print(f"[NuGraph4] Initialized with hit_features (embedding dim) = {in_feat}")
+            print(f"[NuGraph4] semantic_classes = {getattr(self, 'semantic_classes', None)}")
+            self._nug4_init_logged = True
 
         # Semantic classes (optionally read out_features from existing decoder)
         out_feat = len(getattr(self, "semantic_classes", []) or [0, 1])
@@ -75,7 +101,6 @@ class NuGraph4(NuGraph3):
         self._coh_phase_logged_rampup = False
         self._coh_phase_logged_full = False
 
-
     # ----------------------------------------------------------------------
     # Helper: rank-0 check to avoid DDP spam
     # ----------------------------------------------------------------------
@@ -84,9 +109,6 @@ class NuGraph4(NuGraph3):
         Returns True only on global rank 0 (if trainer is attached).
         Before trainer is set, we default to True.
         """
-        # Avoid touching the Lightning `trainer` property directly when running
-        # a standalone model (load_from_checkpoint without Trainer), since that
-        # raises RuntimeError. Fall back to True in that case.
         trainer = getattr(self, "_trainer", None)
         if trainer is None:
             try:
@@ -108,6 +130,10 @@ class NuGraph4(NuGraph3):
 
         where z_src/z_dst are the learned hit embeddings (x), and the rest
         are geometric / low-level quantities.
+
+        NOTE: The new sidecar semantic features are already absorbed into
+        the embeddings x via the NuGraph3 encoder, so they influence
+        z_src/z_dst automatically.
         """
         pos = h.pos  # [N, D]
         plane = getattr(h, "plane", None)
@@ -419,6 +445,10 @@ class NuGraph4(NuGraph3):
            - edge loss (weighted by lambda_edge, with warm-up)
         3. For 'test' (and other stages), keep base loss/metrics but still
            compute edge logits and stash them on batch['hit'] for evaluation.
+
+        NOTE: The new semantic sidecar features are already folded into the
+        hit embeddings h.x by the time we get here. This method just works
+        on those embeddings; no special handling of sidecar channels is needed.
         """
         base = super().forward(batch, stage)
 

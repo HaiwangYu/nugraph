@@ -257,30 +257,54 @@ def main(args):
             "(interpreted in the EXACT order printed above)."
         )
 
-    # === SANITY B: inspect one train batch (transformed) ===
-    if global_rank == 0:
+    # === SANITY B: inspect one train batch (transformed) & infer in_features ===
+    batch = None
+    try:
+        td = nudata.train_dataloader()
+        batch = next(iter(td))  # one batch on each rank
+    except Exception as e:
+        if global_rank == 0:
+            print("[Sanity] Could not inspect a batch:", e)
+
+    if batch is not None:
+        # Print semantic label distribution (rank 0 only)
         try:
-            td = nudata.train_dataloader()
-            batch = next(iter(td))  # one batch
             y = batch["hit"].y_semantic
             uniques, counts = torch.unique(y, return_counts=True)
-            print(
-                "[Sanity] y_semantic unique values (with counts):",
-                {int(u.item()): int(c.item()) for u, c in zip(uniques, counts)}
-            )
+            if global_rank == 0:
+                print(
+                    "[Sanity] y_semantic unique values (with counts):",
+                    {int(u.item()): int(c.item()) for u, c in zip(uniques, counts)}
+                )
 
-            sc = getattr(nudata, "semantic_classes", None)
-            if sc is not None:
-                mask = y >= 0
-                if mask.any():
-                    yv = y[mask]
-                    for idx in range(len(sc)):
-                        n = int((yv == idx).sum().item())
-                        print(f"[Sanity] hits with class index {idx} ('{sc[idx]}'): {n}")
-                else:
-                    print("[Sanity] No labeled hits (all -1) in this sampled batch.")
+                sc = getattr(nudata, "semantic_classes", None)
+                if sc is not None:
+                    mask = y >= 0
+                    if mask.any():
+                        yv = y[mask]
+                        for idx in range(len(sc)):
+                            n = int((yv == idx).sum().item())
+                            print(f"[Sanity] hits with class index {idx} ('{sc[idx]}'): {n}")
+                    else:
+                        print("[Sanity] No labeled hits (all -1) in this sampled batch.")
         except Exception as e:
-            print("[Sanity] Could not inspect a batch:", e)
+            if global_rank == 0:
+                print("[Sanity] Could not print y_semantic stats:", e)
+
+        # NEW: infer in_features from hit.x and override args.in_features
+        try:
+            x = batch["hit"].x
+            feat_dim = int(x.shape[-1])
+            if args.in_features != feat_dim and global_rank == 0:
+                print(
+                    f"[Sanity] Detected hit.x feature dim = {feat_dim}; "
+                    f"overriding args.in_features (was {args.in_features})."
+                )
+            args.in_features = feat_dim
+        except Exception as e:
+            if global_rank == 0:
+                print("[Sanity] Could not infer in_features from batch['hit'].x:", e)
+
 
     model_semantic_classes = getattr(nudata, "semantic_classes", None)
     if args.semantic_head and model_semantic_classes is None:
@@ -513,8 +537,9 @@ if __name__ == "__main__":
                    help="Choose model architecture.")
 
     # --- Model Configuration ---
-    p.add_argument("--in-features", type=int, default=8,
-                   help="Number of input node features.")
+    p.add_argument("--in-features", type=int, default=10,
+                   help="Number of input node features (after PositionFeatures; "
+                        "now 5 base + 2 sidecar + 3 pos = 10).")
     p.add_argument("--hit-features", type=int, default=256,
                    help="Dimension of hit node embeddings.")
     p.add_argument("--nexus-features", type=int, default=64,

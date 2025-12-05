@@ -2,7 +2,7 @@
 #PBS -N Nugraph_DDP
 #PBS -l select=4:ncpus=32:ngpus=4:mem=128gb
 #PBS -l walltime=1:00:00
-#PBS -q preemptable
+#PBS -q debug-scaling
 #PBS -A neutrinoGPU::debug
 #PBS -l filesystems=home:grand:eagle
 #PBS -j oe
@@ -63,7 +63,7 @@ echo "NODES=${NODES} GPUS_PER_NODE=${GPUS_PER_NODE} WORLD_SIZE=${WORLD_SIZE}"
 echo "MASTER_ADDR=${MASTER_ADDR} MASTER_PORT=${MASTER_PORT}"
 
 LOGDIR=/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/nugraph/notebooks/log
-RUN_NAME=nug4_semanticonly_frac0p7
+RUN_NAME=nug4_sem_vtxside_scw6_b8_it7_hf256_nf64_nowt_v1
 CKPT_PATH="${LOGDIR}/${RUN_NAME}/checkpoints/last.ckpt"
 [ -f "${CKPT_PATH}" ] || CKPT_PATH=""
 
@@ -78,13 +78,13 @@ mpiexec -hostfile "${HOSTFILE}" -n "${WORLD_SIZE}" -ppn "${GPUS_PER_NODE}" --env
     --gpus-per-node "${GPUS_PER_NODE}" \
     --learning-rate 1e-4 \
     --hit-features 256 \
-    --semantic-class-weight 10.0 1.0 \
+    --semantic-class-weight 6.0 1.0 \
     --num-iters 7 \
     --nexus-features 64 \
     --interaction-features 32 \
-    --in-features 10 \
+    --in-features 18 \
     --min-nu-hits 0 \
-    --shuffle weighted \
+    --shuffle random \
     --balance-frac 0.10 \
     --edge-hidden-dim 32 \
     --embed-dim 64 \
@@ -95,7 +95,7 @@ mpiexec -hostfile "${HOSTFILE}" -n "${WORLD_SIZE}" -ppn "${GPUS_PER_NODE}" --env
     --coh-edge-thr 0.7 \
     --coh-min-cluster 2 \
     --batch-size 8 \
-    --train-fraction 0.7 \
+    --train-fraction 1.0 \
     ${CKPT_PATH:+--resume-from "${CKPT_PATH}"}
 
 # Optional: keep the hostfile for debugging; otherwise uncomment the next line

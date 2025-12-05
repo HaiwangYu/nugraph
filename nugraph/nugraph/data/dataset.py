@@ -35,24 +35,25 @@ class NuGraphDataset(Dataset):
 
     def get(self, idx: int) -> NuGraphData:
         """
-        Load one event via NuGraphData, then augment the 'hit' store with
-        truth-level y_instance and extra per-hit features.
+        Load one event via NuGraphData, then augment the 'hit' store with:
+          1) truth-level y_instance (per-hit instance IDs)
+          2) extra per-hit semantic features from sidecar HDF5 group
+             /sem_features/sp (e.g. d_wall, d_top, linearity, sphericity, ty, tz).
         """
         name = self.samples[idx]
         dset = self.file[f"/dataset/{name}"]    # scalar compound dataset
         rec = dset[()]                          # numpy.void record
 
-        # Base graph: this already builds hit.x, hit.y_semantic, edges, etc.
+        # Base graph: builds hit.x, hit.y_semantic, edges, plane nodes, etc.
         data = NuGraphData.load(dset)
 
-        # If there is no hit store (shouldn't happen for your file), just return
         if "hit" not in data.node_stores:
             return data
 
         hit = data["hit"]
 
         # ------------------------------------------------------------------
-        # 1) Build truth y_instance from per-plane y_instance arrays
+        # 1) Attach per-hit truth instance labels from u/v/y/y_instance
         # ------------------------------------------------------------------
         needed_fields = ("u/y_instance", "v/y_instance", "y/y_instance")
         if all(field in rec.dtype.names for field in needed_fields):
@@ -61,19 +62,18 @@ class NuGraphDataset(Dataset):
             v_inst = np.asarray(rec["v/y_instance"])
             y_inst = np.asarray(rec["y/y_instance"])
 
-            N = hit.pos.size(0)
-            y_instance = torch.full((N,), -1, dtype=torch.long)
-
-            if not hasattr(hit, "plane"):
-                # If plane metadata is missing, skip instance labeling
+            if not hasattr(hit, "pos") or not hasattr(hit, "plane"):
                 return data
 
+            N = hit.pos.size(0)
+            y_instance = torch.full((N,), -1, dtype=torch.long)
             plane = hit.plane
+
             mask_u = (plane == 0)
             mask_v = (plane == 1)
             mask_y = (plane == 2)
 
-            # Sanity checks: number of hits per plane must match the per-plane arrays
+            # Sanity: hits per plane must match lengths of per-plane arrays
             if mask_u.sum().item() == len(u_inst) and \
                mask_v.sum().item() == len(v_inst) and \
                mask_y.sum().item() == len(y_inst):
@@ -82,63 +82,34 @@ class NuGraphDataset(Dataset):
                 y_instance[mask_v] = torch.from_numpy(v_inst).long()
                 y_instance[mask_y] = torch.from_numpy(y_inst).long()
 
-                # Attach to hit store as truth instance labels
-                hit.y_instance = y_instance
+                hit.y_instance = y_instance  # truth instance IDs per hit
 
         # ------------------------------------------------------------------
-        # 2) NEW: append 2 extra per-hit features to hit.x
+        # 2) Append sidecar semantic features to hit.x
+        #
+        # Sidecar layout (per event):
+        #   /sem_features/sp/<name>  ->  (N_hits, F_sem)
+        #
+        # We *do not* add any separate vertex features here anymore.
+        # Vertex info is already encoded at the sp-node level (sp.features)
+        # and also available for building the sidecar.
         # ------------------------------------------------------------------
-        # At this point, hit.x is whatever NuGraphData.load built
-        # (currently 5 features), and PositionFeatures later will
-        # concatenate pos (3) to make 8. We now add *two* more so that
-        # after PositionFeatures we end up with 10 features total.
-        # ------------------------------------------------------------------
-        if hasattr(hit, "x") and hasattr(hit, "plane"):
+        if hasattr(hit, "x"):
             N = hit.x.size(0)
-            plane = hit.plane
 
-            # allocate extra feature tensor (N hits, 2 new features)
-            extra = torch.zeros((N, 2), dtype=hit.x.dtype)
+            if "sem_features" in self.file:
+                sp_group = self.file["sem_features"]
+                if "sp" in sp_group and name in sp_group["sp"]:
+                    sem_arr = np.asarray(sp_group["sp"][name])  # (N_hits, F_sem)
+                    sem = torch.from_numpy(sem_arr).to(hit.x.dtype)
 
-            # TODO: replace these field names with your actual datasets
-            # e.g. "u/vtx_r" and "u/vtx_zrel", or whatever you wrote in H5
-            # Make sure all 6 names exist in rec.dtype.names.
-            try:
-                u_f0 = np.asarray(rec["u/vtx_feat0"])  # <-- CHANGE NAME
-                u_f1 = np.asarray(rec["u/vtx_feat1"])  # <-- CHANGE NAME
-                v_f0 = np.asarray(rec["v/vtx_feat0"])  # <-- CHANGE NAME
-                v_f1 = np.asarray(rec["v/vtx_feat1"])  # <-- CHANGE NAME
-                y_f0 = np.asarray(rec["y/vtx_feat0"])  # <-- CHANGE NAME
-                y_f1 = np.asarray(rec["y/vtx_feat1"])  # <-- CHANGE NAME
-            except KeyError:
-                # If features aren't present, just return without modifying hit.x
-                return data
+                    # Require exact per-hit alignment
+                    if sem.ndim == 2 and sem.shape[0] == N:
+                        hit.x = torch.cat([hit.x, sem], dim=-1)
 
-            mask_u = (plane == 0)
-            mask_v = (plane == 1)
-            mask_y = (plane == 2)
-
-            # sanity: lengths must match hits-per-plane
-            if mask_u.sum().item() != len(u_f0) or mask_u.sum().item() != len(u_f1):
-                return data
-            if mask_v.sum().item() != len(v_f0) or mask_v.sum().item() != len(v_f1):
-                return data
-            if mask_y.sum().item() != len(y_f0) or mask_y.sum().item() != len(y_f1):
-                return data
-
-            # fill extra features per plane
-            extra[mask_u, 0] = torch.from_numpy(u_f0)
-            extra[mask_u, 1] = torch.from_numpy(u_f1)
-            extra[mask_v, 0] = torch.from_numpy(v_f0)
-            extra[mask_v, 1] = torch.from_numpy(v_f1)
-            extra[mask_y, 0] = torch.from_numpy(y_f0)
-            extra[mask_y, 1] = torch.from_numpy(y_f1)
-
-            # concatenate onto existing hit.x
-            hit.x = torch.cat([hit.x, extra], dim=-1)
-            # (Before PositionFeatures: 5+2 = 7; after cat(pos, x): 3+7 = 10)
-
-            # optional one-time debug print (comment out later)
-            # print("DEBUG hit.x shape after augmentation:", hit.x.shape)
+                        # Optional debug once:
+                        # print(f"[DEBUG] {name}: hit.x.shape after sidecar = {hit.x.shape}")
+                    # else:
+                        # print(f"[WARN] sem_features/sp/{name} shape {sem.shape} != (N_hits={N}, F_sem)")
 
         return data
