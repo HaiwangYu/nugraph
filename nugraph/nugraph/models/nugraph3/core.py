@@ -33,6 +33,11 @@ class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
             nn.Mish(),
             nn.Linear(out_features, out_features),
             nn.Mish())
+        
+        self.has_residual = (target_features == out_features)
+        if not self.has_residual:
+            self.residual_proj = nn.Linear(target_features, out_features)
+
 
     def forward(self, x: T, edge_index: T) -> T: # pylint: disable=arguments-differ
         """
@@ -59,21 +64,18 @@ class NuGraphBlock(MessagePassing): # pylint: disable=abstract-method
         """
         # return self.edge_net(torch.cat((x_i, x_j), dim=1).detach()) * x_j
         return self.edge_net(torch.cat((x_i, x_j), dim=1)) * x_j
-
-    def update(self, aggr_out: T, x: T) -> T: # pylint: disable=arguments-differ
-        """
-        NuGraphBlock update function
-
-        This function takes the output node features and combines them with
-        the input features
-
-        Args:
-            aggr_out: Tensor of aggregated node features
-            x: Target node features
-        """
+        
+    def update(self, aggr_out: T, x: T) -> T:
         if isinstance(x, tuple):
             _, x = x
-        return self.net(torch.cat((aggr_out, x), dim=1))
+        
+        mlp_out = self.net(torch.cat((aggr_out, x), dim=1))
+        
+        # NEW: Add residual connection
+        if self.has_residual:
+            return x + mlp_out  # Simple additive residual
+        else:
+            return self.residual_proj(x) + mlp_out  # Project then add
 
 class NuGraphCore(nn.Module):
     """

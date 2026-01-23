@@ -18,11 +18,7 @@ from .decoders import (SemanticDecoder, FilterDecoder, EventDecoder, VertexDecod
 
 from ...data import H5DataModule
 
-# if torch.cuda.is_available():
-#     from rmm.allocators.torch import rmm_torch_allocator
-#     torch.cuda.memory.change_current_allocator(rmm_torch_allocator)
-
- # Optional RMM (RAPIDS) allocator: enable only if requested AND available
+# Optional RMM (RAPIDS) allocator: enable only if requested AND available
 _use_rmm_env = os.environ.get("NUGRAPH_USE_RMM", "0").lower() in ("1","true","yes","y")
 if torch.cuda.is_available() and _use_rmm_env:
     try:
@@ -31,6 +27,7 @@ if torch.cuda.is_available() and _use_rmm_env:
         print("[nugraph] Using RMM CUDA allocator.")
     except Exception as _e:
         print(f"[nugraph] RMM not available ({_e}); using default CUDA allocator.")
+
 
 class NuGraph3(LightningModule):
     """
@@ -53,6 +50,8 @@ class NuGraph3(LightningModule):
         instance_head: Whether to enable instance decoder
         spacepoint_head: Whether to enable spacepoint decoder
         use_checkpointing: Whether to use checkpointing
+        use_sp_features: Whether to use SP-level features in encoder
+        use_vtx_features: Whether to include vertex features (cheating if True)
         lr: Learning rate
     """
     def __init__(self,
@@ -73,6 +72,8 @@ class NuGraph3(LightningModule):
                  instance_head: bool = False,
                  spacepoint_head: bool = False,
                  use_checkpointing: bool = False,
+                 use_sp_features: bool = True,
+                 use_vtx_features: bool = False,
                  lr: float = 0.001):
         super().__init__()
 
@@ -80,6 +81,7 @@ class NuGraph3(LightningModule):
 
         self.save_hyperparameters()
 
+        self.hit_features = hit_features
         self.nexus_features = nexus_features
         self.interaction_features = interaction_features
 
@@ -87,9 +89,20 @@ class NuGraph3(LightningModule):
         self.event_classes = event_classes
         self.num_iters = num_iters
         self.lr = lr
+        
+        # Store feature flags for reference
+        self.use_sp_features = use_sp_features
+        self.use_vtx_features = use_vtx_features
 
-        self.encoder = Encoder(in_features, hit_features,
-                               nexus_features, interaction_features)
+        # Encoder with SP feature support
+        self.encoder = Encoder(
+            in_features, 
+            hit_features,
+            nexus_features, 
+            interaction_features,
+            use_sp_features=use_sp_features,
+            use_vtx_features=use_vtx_features,
+        )
 
         self.core_net = NuGraphCore(hit_features,
                                     nexus_features,
@@ -125,6 +138,15 @@ class NuGraph3(LightningModule):
 
         if not self.decoders:
             raise RuntimeError('At least one decoder head must be enabled!')
+        
+        # One-time logging of feature configuration
+        if not hasattr(self, '_logged_feature_config'):
+            print(f"[NuGraph3] Feature configuration:")
+            print(f"  use_sp_features: {use_sp_features}")
+            print(f"  use_vtx_features: {use_vtx_features}")
+            if use_vtx_features:
+                print(f"  ⚠️  WARNING: Vertex features enabled - using MC truth info!")
+            self._logged_feature_config = True
 
     def forward(self, data: Data, stage: str = None): # pylint: disable=arguments-differ
         """
@@ -202,14 +224,9 @@ class NuGraph3(LightningModule):
         return [optimizer], {'scheduler': onecycle, 'interval': 'step'}
 
     @staticmethod
-    def transform(planes: tuple[str]) -> Transform:
-        """
-        Return data transform for NuGraph3 model
-        
-        Args:
-            planes: tuple of detector plane names
-        """
-        return Transform(planes)
+    def transform(planes: tuple[str], in_features: int = 10) -> Transform:
+        return Transform(planes, in_features=in_features)
+
 
     @staticmethod
     def add_model_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -222,7 +239,7 @@ class NuGraph3(LightningModule):
         model = parser.add_argument_group('model', 'NuGraph3 model configuration')
         model.add_argument('--num-iters', type=int, default=5,
                            help='Number of message-passing iterations')
-        model.add_argument('--in-feats', type=int, default=5,
+        model.add_argument('--in-feats', type=int, default=10,
                            help='Number of input node features')
         model.add_argument('--hit-feats', type=int, default=128,
                            help='Hidden dimensionality of hit convolutions')
@@ -251,6 +268,13 @@ class NuGraph3(LightningModule):
                            help='Maximum number of epochs to train for')
         model.add_argument('--learning-rate', type=float, default=0.001,
                            help='Max learning rate during training')
+        # NEW: SP feature control
+        model.add_argument('--use-sp-features', action='store_true', default=True,
+                           help='Use SP-level features (charge, hit count) in encoder')
+        model.add_argument('--no-sp-features', action='store_false', dest='use_sp_features',
+                           help='Disable SP-level features in encoder')
+        model.add_argument('--use-vtx-features', action='store_true', default=False,
+                           help='Include vertex distance features (USES MC TRUTH - for ablation only)')
         return parser
 
     @classmethod
@@ -279,4 +303,6 @@ class NuGraph3(LightningModule):
             instance_head=args.instance,
             spacepoint_head=args.spacepoint,
             use_checkpointing=args.use_checkpointing,
+            use_sp_features=getattr(args, 'use_sp_features', True),
+            use_vtx_features=getattr(args, 'use_vtx_features', False),
             lr=args.learning_rate)

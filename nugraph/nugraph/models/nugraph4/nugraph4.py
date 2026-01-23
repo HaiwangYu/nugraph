@@ -18,6 +18,8 @@ class NuGraph4(NuGraph3):
         lambda_coh: float = 0.0,      # NEW: cluster coherence loss weight
         coh_edge_thr: float = 0.7,    # threshold for p_same when forming clusters
         coh_min_cluster: int = 2,     # min cluster size for coherence loss
+        use_sp_features: bool = True,       # NEW: passed to parent
+        use_vtx_features: bool = False,     # NEW: passed to parent
         **kwargs,
     ):
         """
@@ -32,22 +34,35 @@ class NuGraph4(NuGraph3):
         NuGraphDataset, then PositionFeatures concatenates pos → final
         per-hit input dimension = `in_features` (CLI arg).
 
-        NuGraph3’s encoder uses `in_features` to map those raw channels
+        NuGraph3's encoder uses `in_features` to map those raw channels
         to `hit_features` (the learned embedding dim).
 
         Here, `in_feat = self.hit_features` is that embedding dim, so
-        NuGraph4 automatically “sees” the sidecar features through x.
+        NuGraph4 automatically "sees" the sidecar features through x.
         No extra plumbing is needed here.
+        
+        NEW: SP-level features (charge, hit count, optionally vertex distance)
+        can be incorporated via use_sp_features and use_vtx_features flags.
         """
-        super().__init__(*args, **kwargs)
+        # Pass SP feature flags to parent NuGraph3
+        super().__init__(
+            *args, 
+            use_sp_features=use_sp_features,
+            use_vtx_features=use_vtx_features,
+            **kwargs
+        )
 
         # Hit embedding dimension from the encoder/core (NOT raw input channels)
         in_feat = getattr(self, "hit_features", 256)
 
-        # Optional one-time debug: confirm we’re using the expected embedding dim
+        # Optional one-time debug: confirm we're using the expected embedding dim
         if not hasattr(self, "_nug4_init_logged"):
             print(f"[NuGraph4] Initialized with hit_features (embedding dim) = {in_feat}")
             print(f"[NuGraph4] semantic_classes = {getattr(self, 'semantic_classes', None)}")
+            print(f"[NuGraph4] use_sp_features = {use_sp_features}")
+            print(f"[NuGraph4] use_vtx_features = {use_vtx_features}")
+            if use_vtx_features:
+                print(f"[NuGraph4] ⚠️  WARNING: Vertex features enabled - using MC truth info!")
             self._nug4_init_logged = True
 
         # Semantic classes (optionally read out_features from existing decoder)
@@ -73,6 +88,15 @@ class NuGraph4(NuGraph3):
         in_edge_dim = 2 * in_feat + 7
         self.edge_mlp = nn.Sequential(
             nn.Linear(in_edge_dim, edge_hidden_dim),
+            nn.ReLU(),
+            nn.Linear(edge_hidden_dim, 1),
+        )
+
+        # SP-specific edge MLP for supervision edges (uses nexus_features not hit_features)
+        sp_feat = getattr(self, "nexus_features", 64)
+        in_edge_dim_sp = 2 * sp_feat + 4  # z_src, z_dst, dx, dy, dz, dr (no plane/charge/time for SP)
+        self.edge_mlp_sp = nn.Sequential(
+            nn.Linear(in_edge_dim_sp, edge_hidden_dim),
             nn.ReLU(),
             nn.Linear(edge_hidden_dim, 1),
         )
@@ -178,14 +202,45 @@ class NuGraph4(NuGraph3):
         )
         return edge_attr  # [E, 2*in_feat + 7]
 
+
+    # ----------------------------------------------------------------------
+    # Helper: build per-edge features from SP embeddings + geometry
+    # ----------------------------------------------------------------------
+    def _build_edge_attr_sp(self, sp, x, edge_index):
+        """
+        Build edge features for SP-to-SP edges:
+        concat( z_src, z_dst, dx, dy, dz, dr )
+        
+        SP nodes don't have plane/charge/time, so we only use position differences.
+        """
+        pos = sp.pos  # [N, 3] for SP nodes
+        src, dst = edge_index[0], edge_index[1]
+
+        # Geometric differences
+        d = pos[dst] - pos[src]  # [E, 3]
+        dx = d[:, 0:1]
+        dy = d[:, 1:2]
+        dz = d[:, 2:3]
+        dr = torch.linalg.vector_norm(d, ord=2, dim=1, keepdim=True)
+
+        # Learned SP embeddings
+        z_src = x[src]  # [E, sp_feat=64]
+        z_dst = x[dst]  # [E, sp_feat=64]
+
+        edge_attr = torch.cat(
+            [z_src, z_dst, dx, dy, dz, dr],
+            dim=1,
+        )
+        return edge_attr  # [E, 2*64 + 4 = 132]
     # ----------------------------------------------------------------------
     # Helper: compute edge logits + labels from instance IDs
     # ----------------------------------------------------------------------
     def _edge_logits_and_labels(self, x, edge_index, batch):
         """
         Edge labels: positive if both endpoints belong to same particle instance.
+        NOTE: This method is unused - kept for backward compatibility
         """
-        h = batch["hit"]
+        h = batch["sp"]  # Use sp store (though this method isn't called)
 
         # Correct field: particle instance ID
         y_instance = getattr(h, "pid", None)
@@ -340,16 +395,16 @@ class NuGraph4(NuGraph3):
         self,
         x,
         batch,
-        max_hits: int = 512,
+        max_nodes: int = 512,
         margin: float = 0.5,
     ):
         """
-        Contrastive-style loss on hit embeddings x using true instance IDs.
+        Contrastive-style loss on SP embeddings x using true instance IDs.
 
         IMPORTANT: operates per-graph (per event) using h.batch, so we never
-        mix hits from different events that happen to share the same pid.
+        mix nodes from different events that happen to share the same pid.
         """
-        h = batch["hit"]
+        h = batch["sp"]
 
         # True instance ID per hit
         y_instance = getattr(h, "pid", None)
@@ -380,8 +435,8 @@ class NuGraph4(NuGraph3):
             idx = g_mask.nonzero(as_tuple=False).view(-1)
 
             # Subsample to control O(N^2) cost
-            if idx.numel() > max_hits:
-                perm = torch.randperm(idx.numel(), device=device)[:max_hits]
+            if idx.numel() > max_nodes:
+                perm = torch.randperm(idx.numel(), device=device)[:max_nodes]
                 idx = idx[perm]
 
             z = x[idx]                      # [M, D] embeddings
@@ -458,23 +513,51 @@ class NuGraph4(NuGraph3):
 
         loss, metrics = base
 
-        # If no hit store or no x, we can't do embed/edge logic
-        if "hit" not in batch.node_types:
+        # If no sp store or no x, we can't do embed/edge logic
+        # CRITICAL: Use SP store because supervision edges connect SP nodes
+        if "sp" not in batch.node_types:
             return loss, metrics
-        h = batch["hit"]
+        h = batch["sp"]
         if not hasattr(h, "x"):
             return loss, metrics
 
-        x = h.x  # learned hit embeddings
+        x = h.x  # learned SP embeddings (64-dim from nexus aggregation)
         total_loss = loss
+        # -------------------------
+        # Optional hygiene (in-memory only):
+        # y_instance/pid must be -1 on ghosts so nothing downstream can treat them as valid.
+        # -------------------------
+        ys = getattr(h, "y_semantic", None)
+        if ys is not None:
+            ys = ys.long()
+        
+        pid = getattr(h, "pid", None)
+        if pid is None:
+            pid = getattr(h, "y_instance", None)
+        
+        if ys is not None and pid is not None:
+            pid = pid.long()
+            ghost = (ys == -1)
+            if ghost.any():
+                pid = pid.clone()
+                pid[ghost] = -1
+                # write back to the same attribute name used by the dataset
+                if hasattr(h, "pid"):
+                    h.pid = pid
+                else:
+                    h.y_instance = pid
 
         # ------------------------------------------------------------------
-        # 1) Instance embedding loss
+        # 1) Instance embedding loss (ONLY compute when enabled)
         # ------------------------------------------------------------------
-        embed_loss = self._instance_embedding_loss(x, batch)
+        embed_loss = None
         embed_weight = 0.0
+        
+        if self.lambda_embed > 0.0:
+            embed_loss = self._instance_embedding_loss(x, batch)
+        
+        if embed_loss is not None:
 
-        if embed_loss is not None and self.lambda_embed > 0.0:
             if stage in ("train", "val"):
                 try:
                     current_epoch = self.trainer.current_epoch
@@ -519,7 +602,7 @@ class NuGraph4(NuGraph3):
                 embed_weight = 0.0
 
         # ------------------------------------------------------------------
-        # 2) Edge logits + loss (edge logits are also stashed for eval)
+        # 2) Edge logits + loss (USE supervision edges; only labelable==1)
         # ------------------------------------------------------------------
         edge_loss = None
         edge_weight = 0.0
@@ -527,76 +610,61 @@ class NuGraph4(NuGraph3):
         edge_index_valid = None
         edge_probs = None
 
-        # We may need edge logits/probs for edge loss and/or coherence loss
         need_edges = (self.lambda_edge > 0.0) or (self.lambda_coh > 0.0)
 
         if need_edges:
-            edge_key = ("hit", "delaunay-planar", "hit")
-            if hasattr(batch, "edge_index_dict") and edge_key in batch.edge_index_dict:
-                edge_index = batch[edge_key].edge_index
-                edge_logit, y_edge, edge_index_valid = self._edge_logits_and_labels(
-                    x, edge_index, batch
-                )
+            sup_key = ("sp", "supervision", "sp")
+            if sup_key in batch.edge_types:
+                es = batch[sup_key]
+                edge_index = es.edge_index.long()          # (2, E)
+                edge_labelable = es.edge_labelable.long()  # (E,)
+                y_edge = es.edge_y.float()                 # (E,)
 
-                if edge_logit is not None and edge_index_valid is not None:
+                # Only labelable edges contribute to edge loss
+                m = (edge_labelable == 1)
+                if m.any():
+                    edge_index_valid = edge_index[:, m]
+                    y_edge_valid = y_edge[m]
+
+                    # -----------------------
+                    # Batch-time hard asserts
+                    # NOTE: Use h (sp store) since supervision edges connect SP nodes
+                    # -----------------------
+                    ys = h.y_semantic.long()
+                    a = edge_index_valid[0]
+                    b = edge_index_valid[1]
+                    assert (((ys[a] == -1) | (ys[b] == -1)).sum().item() == 0), "Labelable edges touch ghosts"
+
+                    pid = getattr(h, "pid", None)
+                    if pid is None:
+                        pid = getattr(h, "y_instance", None)
+                    if pid is not None:
+                        pid = pid.long()
+                        assert (((pid[a] < 0) | (pid[b] < 0)).sum().item() == 0), "Labelable edges have yi<0 endpoints"
+
+                    # Build edge logits from learned embeddings + geometry
+                    # Use SP-specific edge builder for supervision edges
+                    edge_attr = self._build_edge_attr_sp(h, x, edge_index_valid)
+                    edge_logit = self.edge_mlp_sp(edge_attr).squeeze(-1)
                     edge_probs = torch.sigmoid(edge_logit)
 
-                if (
-                    self.lambda_edge > 0.0
-                    and edge_logit is not None
-                    and y_edge is not None
-                    and y_edge.numel() > 0
-                ):
-                    # Always stash logits + the VALID edge_index for evaluation (all stages)
+                    # Always stash for eval
                     h.edge_logits = edge_logit.detach()
-                    h.edge_index = edge_index_valid
+                    h.edge_index = edge_index_valid.detach()
 
-                    if stage in ("train", "val"):
-                        try:
-                            current_epoch = self.trainer.current_epoch
-                        except (AttributeError, RuntimeError):
-                            current_epoch = 0
+                    if self.lambda_edge > 0.0 and stage in ("train", "val"):
+                        # No warmup complexity for smoke test; keep it simple
+                        edge_weight = float(self.lambda_edge)
 
-                        WARMUP_EPOCHS = 10
-                        RAMPUP_EPOCHS = 10
-
-                        if current_epoch < WARMUP_EPOCHS:
-                            edge_weight = 0.0
-                            if self._is_rank0() and not self._warmup_phase_logged_edge:
-                                print(
-                                    f"\n[EDGE WARM-UP] Epochs 0-{WARMUP_EPOCHS-1}: "
-                                    f"Edge loss DISABLED (semantic-only training)"
-                                )
-                                self._warmup_phase_logged_edge = True
-                        elif current_epoch < WARMUP_EPOCHS + RAMPUP_EPOCHS:
-                            ramp_progress = (current_epoch - WARMUP_EPOCHS) / RAMPUP_EPOCHS
-                            edge_weight = self.lambda_edge * ramp_progress
-                            if self._is_rank0() and not self._rampup_phase_logged_edge:
-                                print(
-                                    f"\n[EDGE RAMP-UP] Epochs {WARMUP_EPOCHS}-"
-                                    f"{WARMUP_EPOCHS+RAMPUP_EPOCHS-1}: "
-                                    f"Edge loss ramping from 0 to {self.lambda_edge}"
-                                )
-                                self._rampup_phase_logged_edge = True
-                        else:
-                            edge_weight = self.lambda_edge
-                            if self._is_rank0() and not self._full_phase_logged_edge:
-                                print(
-                                    f"\n[EDGE FULL] Epoch {WARMUP_EPOCHS+RAMPUP_EPOCHS}+: "
-                                    f"Full edge loss (λ_edge={self.lambda_edge})"
-                                )
-                                self._full_phase_logged_edge = True
-
-                        edge_weight = max(0.0, min(self.lambda_edge, float(edge_weight)))
-
-                        pos_w = torch.tensor(self.edge_pos_weight, device=edge_logit.device)
+                        pos_w = torch.tensor(float(self.edge_pos_weight), device=edge_logit.device)
                         edge_loss = F.binary_cross_entropy_with_logits(
                             edge_logit,
-                            y_edge,
+                            y_edge_valid,
                             pos_weight=pos_w,
                         )
                         total_loss = total_loss + edge_weight * edge_loss
-            # If edge_key not present, we simply skip edge logic.
+            # else: no supervision edges; edge loss remains None
+
 
         # ------------------------------------------------------------------
         # Extend metrics
@@ -707,5 +775,42 @@ class NuGraph4(NuGraph3):
             metrics["loss/coh_weight"] = torch.tensor(coh_weight, device=x.device)
 
         metrics["loss/total"] = total_loss.detach()
+
+        # ------------------------------------------------------------------
+        # 4) Edge metrics for validation/test (instance performance tracking)
+        # ------------------------------------------------------------------
+        if stage in ("val", "test") and edge_logit is not None and edge_index_valid is not None:
+            # Only compute metrics if we have edge predictions
+            if hasattr(h, 'edge_logits') and hasattr(h, 'edge_index'):
+                sup_key = ("sp", "supervision", "sp")
+                if sup_key in batch.edge_types:
+                    es = batch[sup_key]
+                    edge_labelable = es.edge_labelable.long()
+                    y_edge_full = es.edge_y.float()
+                    
+                    labelable_mask = (edge_labelable == 1)
+                    if labelable_mask.any():
+                        y_edge_true = y_edge_full[labelable_mask]
+                        edge_probs_val = torch.sigmoid(h.edge_logits)
+                        edge_pred = (edge_probs_val > 0.5).float()
+                        
+                        with torch.no_grad():
+                            # Accuracy
+                            edge_acc = (edge_pred == y_edge_true).float().mean()
+                            metrics["edge/accuracy"] = edge_acc
+                            
+                            # Precision, Recall, F1
+                            tp = ((edge_pred == 1) & (y_edge_true == 1)).sum().float()
+                            fp = ((edge_pred == 1) & (y_edge_true == 0)).sum().float()
+                            fn = ((edge_pred == 0) & (y_edge_true == 1)).sum().float()
+                            tn = ((edge_pred == 0) & (y_edge_true == 0)).sum().float()
+                            
+                            precision = tp / (tp + fp + 1e-8)
+                            recall = tp / (tp + fn + 1e-8)
+                            edge_f1 = 2 * precision * recall / (precision + recall + 1e-8)
+                            
+                            metrics["edge/f1"] = edge_f1
+                            metrics["edge/precision"] = precision
+                            metrics["edge/recall"] = recall
 
         return total_loss, metrics

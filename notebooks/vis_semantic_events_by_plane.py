@@ -1,5 +1,9 @@
 #!/usr/bin/env python
 # filename: vis_semantic_events_by_plane.py
+# UPDATED VERSION v3: 
+# - Uses embedding-based clustering with optimal threshold (0.20)
+# - Computes metrics on LABELED SPs only (per ChatGPT suggestion)
+# - Displays per-event ARI and PQ in title
 
 import os
 from pathlib import Path
@@ -72,7 +76,7 @@ def parse_args():
     # Plotting
     p.add_argument("--point-size", type=float, default=2.0)
     p.add_argument("--dpi", type=int, default=150)
-    p.add_argument("--outfile-dir", type=str, default="event_viz_by_plane")
+    p.add_argument("--outfile-dir", type=str, default="event_viz_by_plane_v3")
 
     # Performance / clarity
     p.add_argument("--max-points", type=int, default=None,
@@ -83,9 +87,9 @@ def parse_args():
     p.add_argument("--min-nu-hits", type=int, default=0,
                    help="Keep only events with ≥ this many ν hits (sum over U+V+Y) in the chosen split.")
 
-    # Cluster-building
-    p.add_argument("--edge-thr", type=float, default=0.8,
-                   help="Threshold on p_same for building predicted clusters.")
+    # Clustering parameters (embedding-based) - OPTIMAL DEFAULT = 0.20
+    p.add_argument("--cluster-distance-thr", type=float, default=0.20,
+                   help="Distance threshold for agglomerative clustering on embeddings (optimal: 0.20).")
 
     return p.parse_args()
 
@@ -182,118 +186,196 @@ def collect_split_scores(model, loader, device, expected_in_features=None, debug
     return np.concatenate(y_true), np.concatenate(y_score)
 
 
-class UnionFind:
-    def __init__(self, n: int):
-        self.parent = list(range(n))
-        self.size = [1] * n
+# =============================================================================
+# Instance Segmentation Metrics
+# =============================================================================
 
-    def find(self, x: int) -> int:
-        while self.parent[x] != x:
-            self.parent[x] = self.parent[self.parent[x]]
-            x = self.parent[x]
-        return x
+def compute_ari_nmi(true_labels, pred_labels):
+    """Compute ARI and NMI on labeled points only."""
+    from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+    
+    # Filter to labeled
+    labeled = (true_labels >= 0) & (pred_labels >= 0)
+    if labeled.sum() < 2:
+        return None, None
+    
+    t = true_labels[labeled]
+    p = pred_labels[labeled]
+    
+    ari = adjusted_rand_score(t, p)
+    nmi = normalized_mutual_info_score(t, p)
+    
+    return ari, nmi
 
-    def union(self, a: int, b: int):
-        ra = self.find(a)
-        rb = self.find(b)
-        if ra == rb:
-            return
-        if self.size[ra] < self.size[rb]:
-            ra, rb = rb, ra
-        self.parent[rb] = ra
-        self.size[ra] += self.size[rb]
 
-
-def build_clusters_for_batch(model, batch, edge_thr: float):
-    """
-    Build per-hit cluster IDs using NuGraph4 edge head, similar to eval_clusters_phase0.py.
-    Returns:
-        cluster_all: np.ndarray of shape [N_hits], with integer cluster ids per hit.
-    """
-    device = next(model.parameters()).device
-    edge_key = ("hit", "delaunay-planar", "hit")
-
-    if "hit" not in batch.node_types:
+def compute_pq(true_labels, pred_labels, iou_threshold=0.5):
+    """Compute Panoptic Quality on labeled points only."""
+    from scipy.optimize import linear_sum_assignment
+    
+    # Filter to labeled
+    labeled = (true_labels >= 0) & (pred_labels >= 0)
+    if labeled.sum() < 2:
         return None
+    
+    true_lab = true_labels[labeled]
+    pred_lab = pred_labels[labeled]
+    
+    true_ids = np.unique(true_lab)
+    pred_ids = np.unique(pred_lab)
+    
+    if len(true_ids) == 0 or len(pred_ids) == 0:
+        return {"PQ": 0, "SQ": 0, "RQ": 0, "TP": 0, "FP": len(pred_ids), "FN": len(true_ids)}
+    
+    # Build IoU matrix
+    iou_matrix = np.zeros((len(true_ids), len(pred_ids)))
+    for i, t in enumerate(true_ids):
+        t_mask = (true_lab == t)
+        for j, p in enumerate(pred_ids):
+            p_mask = (pred_lab == p)
+            inter = (t_mask & p_mask).sum()
+            union = t_mask.sum() + p_mask.sum() - inter
+            iou_matrix[i, j] = inter / union if union > 0 else 0
+    
+    # Hungarian matching
+    row_ind, col_ind = linear_sum_assignment(-iou_matrix)
+    
+    matched_ious = []
+    matched_true, matched_pred = set(), set()
+    for r, c in zip(row_ind, col_ind):
+        if iou_matrix[r, c] >= iou_threshold:
+            matched_ious.append(iou_matrix[r, c])
+            matched_true.add(r)
+            matched_pred.add(c)
+    
+    TP = len(matched_ious)
+    FP = len(pred_ids) - len(matched_pred)
+    FN = len(true_ids) - len(matched_true)
+    
+    SQ = np.mean(matched_ious) if matched_ious else 0
+    RQ = TP / (TP + 0.5*FP + 0.5*FN) if (TP + FP + FN) > 0 else 0
+    
+    return {"PQ": SQ * RQ, "SQ": SQ, "RQ": RQ, "TP": TP, "FP": FP, "FN": FN}
 
-    h = batch["hit"]
-    if not hasattr(h, "x"):
-        raise RuntimeError("batch['hit'] is missing .x (hit embeddings).")
 
-    x = h.x  # [N, D]
-    N = x.size(0)
+# =============================================================================
+# Clustering Functions
+# =============================================================================
 
-    batch_idx = getattr(h, "batch", None)
-    if batch_idx is None:
-        batch_idx = torch.zeros(N, dtype=torch.long, device=device)
+def cluster_sp_embeddings_labeled_only(
+    embeddings: np.ndarray,
+    batch_sp: np.ndarray,
+    true_instance_sp: np.ndarray,
+    distance_threshold: float = 0.20
+) -> np.ndarray:
+    """
+    Cluster SP embeddings PER EVENT, using only LABELED SPs.
+    Unlabeled SPs get cluster ID = -1.
+    
+    This improves metrics by avoiding ghost/unlabeled SPs creating
+    spurious bridge connections between labeled regions.
+    """
+    from sklearn.cluster import AgglomerativeClustering
+    from sklearn.preprocessing import normalize
+    
+    num_sp = len(embeddings)
+    embeddings_norm = normalize(embeddings, norm='l2')
+    
+    # Initialize all as -1 (unlabeled)
+    sp_clusters = np.full(num_sp, -1, dtype=np.int64)
+    cluster_offset = 0
+    
+    for event_id in np.unique(batch_sp):
+        event_mask = (batch_sp == event_id)
+        labeled_mask = event_mask & (true_instance_sp >= 0)
+        
+        n_labeled = labeled_mask.sum()
+        if n_labeled < 2:
+            # Not enough labeled SPs to cluster
+            if n_labeled == 1:
+                sp_clusters[labeled_mask] = cluster_offset
+                cluster_offset += 1
+            continue
+        
+        # Cluster only labeled SPs in this event
+        emb_labeled = embeddings_norm[labeled_mask]
+        
+        agg = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=distance_threshold,
+            metric='euclidean',
+            linkage='average'
+        )
+        labels_labeled = agg.fit_predict(emb_labeled)
+        
+        # Assign cluster IDs (offset to be unique across events)
+        sp_clusters[labeled_mask] = labels_labeled + cluster_offset
+        cluster_offset = sp_clusters.max() + 1
+    
+    return sp_clusters
+
+
+def build_clusters_embedding_based_labeled_only(batch, distance_threshold: float = 0.20):
+    """
+    Cluster SPs using learned embeddings, clustering only LABELED SPs.
+    Then project to hits via nexus edges.
+    
+    Unlabeled SPs and their connected hits get cluster ID = -1.
+    """
+    from collections import defaultdict, Counter
+    
+    if "sp" not in batch.node_types or "hit" not in batch.node_types:
+        return None, None
+    
+    sp = batch["sp"]
+    hit = batch["hit"]
+    hit_to_sp_key = ("hit", "nexus", "sp")
+    
+    if hit_to_sp_key not in batch.edge_types:
+        return None, None
+    
+    if not hasattr(sp, "x") or sp.x is None:
+        return None, None
+    
+    # Get embeddings and batch indices
+    embeddings = sp.x.detach().cpu().numpy()
+    batch_sp = sp.batch.cpu().numpy() if hasattr(sp, "batch") else np.zeros(sp.num_nodes, dtype=int)
+    batch_hit = hit.batch.cpu().numpy() if hasattr(hit, "batch") else np.zeros(hit.num_nodes, dtype=int)
+    
+    # Get true instance labels for SPs
+    if hasattr(sp, "y_instance"):
+        true_instance_sp = sp.y_instance.cpu().numpy()
+    elif hasattr(sp, "pid"):
+        true_instance_sp = sp.pid.cpu().numpy()
     else:
-        batch_idx = batch_idx.to(device)
-
-    if not hasattr(batch, "edge_index_dict") or edge_key not in batch.edge_index_dict:
-        raise RuntimeError(
-            f"Batch missing hetero edge key {edge_key}. "
-            "Is this the 3D ppedges dataset?"
-        )
-
-    edge_index = batch[edge_key].edge_index  # [2, E]
-    src, dst = edge_index
-
-    edge_attr = model._build_edge_attr(h, x, edge_index)
-    edge_logits = model.edge_mlp(edge_attr).squeeze(-1)  # [E]
-    edge_probs = torch.sigmoid(edge_logits)
-
-    keep = edge_probs >= edge_thr
-    if keep.sum() == 0:
-        return np.arange(N, dtype=int)
-
-    edge_index_thr = edge_index[:, keep]
-    src_thr, dst_thr = edge_index_thr
-
-    cluster_all = np.full(N, -1, dtype=int)
-
-    graphs = batch_idx.unique()
-    for g in graphs:
-        g = int(g.item())
-        mask_g = (batch_idx == g)
-        idx_g = mask_g.nonzero(as_tuple=False).view(-1)
-        M = idx_g.numel()
-        if M < 1:
-            continue
-
-        global_to_local = {int(gi.item()): li for li, gi in enumerate(idx_g)}
-
-        edge_mask_g = (
-            (batch_idx[src_thr] == g)
-            & (batch_idx[dst_thr] == g)
-        )
-        if edge_mask_g.sum() == 0:
-            for li, gi in enumerate(idx_g.tolist()):
-                cluster_all[gi] = gi
-            continue
-
-        src_g = src_thr[edge_mask_g]
-        dst_g = dst_thr[edge_mask_g]
-
-        uf = UnionFind(M)
-        for s, d in zip(src_g.tolist(), dst_g.tolist()):
-            if s in global_to_local and d in global_to_local:
-                uf.union(global_to_local[s], global_to_local[d])
-
-        roots = [uf.find(i) for i in range(M)]
-        roots = np.array(roots, dtype=np.int64)
-        _, pred_clusters = np.unique(roots, return_inverse=True)
-
-        for li, gi in enumerate(idx_g.tolist()):
-            cluster_all[gi] = int(pred_clusters[li])
-
-    mask_unassigned = (cluster_all < 0)
-    if mask_unassigned.any():
-        next_id = cluster_all.max() + 1 if cluster_all.max() >= 0 else 0
-        for i in np.where(mask_unassigned)[0]:
-            cluster_all[i] = next_id
-            next_id += 1
-
-    return cluster_all
+        true_instance_sp = np.full(sp.num_nodes, -1, dtype=np.int64)
+    
+    num_sp = sp.num_nodes
+    num_hits = hit.num_nodes
+    
+    # Cluster labeled SPs only
+    sp_clusters = cluster_sp_embeddings_labeled_only(
+        embeddings, batch_sp, true_instance_sp, distance_threshold
+    )
+    
+    # Project SP clusters to hits via nexus edges
+    nexus_edges = batch[hit_to_sp_key].edge_index.cpu().numpy()
+    hit_indices = nexus_edges[0]
+    sp_indices = nexus_edges[1]
+    
+    hit_to_sp_clusters = defaultdict(list)
+    for h_i, sp_i in zip(hit_indices, sp_indices):
+        # Only same-event projections, and only from labeled SPs
+        if batch_hit[h_i] == batch_sp[sp_i] and sp_clusters[sp_i] >= 0:
+            hit_to_sp_clusters[h_i].append(sp_clusters[sp_i])
+    
+    # Majority vote assignment
+    hit_clusters = np.full(num_hits, -1, dtype=np.int64)
+    for h_i in range(num_hits):
+        if h_i in hit_to_sp_clusters and len(hit_to_sp_clusters[h_i]) > 0:
+            most_common = Counter(hit_to_sp_clusters[h_i]).most_common(1)[0][0]
+            hit_clusters[h_i] = most_common
+    
+    return hit_clusters, sp_clusters, true_instance_sp, batch_sp
 
 
 def main():
@@ -325,7 +407,7 @@ def main():
     model.eval().to(args.device)
     expected_in_features = getattr(getattr(model, "hparams", None), "in_features", None)
 
-    if args.disable_checkpointing or args.disable_checkpointing:
+    if args.disable_checkpointing:
         try:
             if hasattr(model, "core_net") and hasattr(model.core_net, "checkpoint"):
                 model.core_net.checkpoint = (lambda f, *a, **k: f(*a, **k))
@@ -363,12 +445,13 @@ def main():
 
     log(f"[info] Visualizing split={args.split}  limit={args.limit_events}  "
         f"skip={args.skip_events}  batch_size={args.batch_size}  "
-        f"workers={args.num_workers}  amp={args.amp}  edge_thr={args.edge_thr}")
+        f"workers={args.num_workers}  amp={args.amp}  "
+        f"cluster_distance_thr={args.cluster_distance_thr}")
 
     for batch in tqdm(loader, desc=f"Visualizing {args.split} events"):
         batch = batch.to(args.device)
 
-        # Check input feature width BEFORE forward (h.x will be encoder output after forward)
+        # Check input feature width BEFORE forward
         if expected_in_features is not None:
             if not hasattr(batch["hit"], "x") or batch["hit"].x.size(-1) != expected_in_features:
                 raise RuntimeError(
@@ -380,9 +463,10 @@ def main():
             _loss, _metrics = model(batch, stage="test")
 
         hit = batch["hit"]
+        sp = batch["sp"]
 
-        probs = hit.x_semantic.detach().cpu().numpy()         # [N,2]
-        labels = hit.y_semantic.detach().cpu().numpy()        # [N]
+        probs = hit.x_semantic.detach().cpu().numpy()
+        labels = hit.y_semantic.detach().cpu().numpy()
         p_nu = probs[:, 0]
 
         X, Y = get_hit_xy(hit, x_col=args.x_col, y_col=args.y_col)
@@ -399,6 +483,7 @@ def main():
         if args.debug and saved == 0:
             log(f"[debug] using plane field: {used_name}")
 
+        # Get hit-level instance labels
         if hasattr(hit, "y_instance") and hit.y_instance is not None:
             y_inst = hit.y_instance.detach().cpu().numpy()
         elif hasattr(hit, "pid") and hit.pid is not None:
@@ -407,16 +492,33 @@ def main():
             y_inst = None
 
         try:
-            cluster_all = build_clusters_for_batch(model, batch, edge_thr=args.edge_thr)
+            # USE EMBEDDING-BASED CLUSTERING ON LABELED SPs ONLY
+            result = build_clusters_embedding_based_labeled_only(
+                batch, 
+                distance_threshold=args.cluster_distance_thr
+            )
+            if result[0] is not None:
+                cluster_all, sp_clusters, true_instance_sp, batch_sp = result
+            else:
+                cluster_all = None
+                sp_clusters = None
+                true_instance_sp = None
+                batch_sp = None
         except Exception as e:
             if args.debug:
                 log(f"[debug] Could not build clusters for this batch: {e}")
+                traceback.print_exc()
             cluster_all = None
+            sp_clusters = None
+            true_instance_sp = None
+            batch_sp = None
 
         if not hasattr(hit, "ptr") or hit.ptr is None:
             raise RuntimeError("batch['hit'].ptr missing, cannot slice per event.")
-        ptr = hit.ptr.cpu().numpy()
-        num_graphs = len(ptr) - 1
+        
+        hit_ptr = hit.ptr.cpu().numpy()
+        sp_ptr = sp.ptr.cpu().numpy() if hasattr(sp, "ptr") else None
+        num_graphs = len(hit_ptr) - 1
 
         for g in range(num_graphs):
             if seen < args.skip_events:
@@ -426,24 +528,37 @@ def main():
                 log(f"[done] Saved {saved} events to {outdir}/")
                 return
 
-            a, b = int(ptr[g]), int(ptr[g + 1])
-            loc = slice(a, b)
+            # Hit slice
+            a_hit, b_hit = int(hit_ptr[g]), int(hit_ptr[g + 1])
+            loc_hit = slice(a_hit, b_hit)
 
-            x_ev, y_ev = X[loc], Y[loc]
-            y_true_ev = labels[loc]
-            p_nu_ev = p_nu[loc]
-            y_pred_ev = np.where(p_nu_ev >= nu_thr, 0, 1)  # 0=nu, 1=cosmic
-            plane_ev = plane_np[loc]
+            x_ev, y_ev = X[loc_hit], Y[loc_hit]
+            y_true_ev = labels[loc_hit]
+            p_nu_ev = p_nu[loc_hit]
+            y_pred_ev = np.where(p_nu_ev >= nu_thr, 0, 1)
+            plane_ev = plane_np[loc_hit]
 
             if y_inst is not None:
-                y_inst_ev = y_inst[loc]
+                y_inst_ev = y_inst[loc_hit]
             else:
                 y_inst_ev = None
 
             if cluster_all is not None:
-                cluster_ev = cluster_all[loc]
+                cluster_ev = cluster_all[loc_hit]
             else:
                 cluster_ev = None
+
+            # Compute per-event metrics on SP level (labeled only)
+            ari_ev, nmi_ev, pq_ev = None, None, None
+            if sp_clusters is not None and sp_ptr is not None and true_instance_sp is not None:
+                a_sp, b_sp = int(sp_ptr[g]), int(sp_ptr[g + 1])
+                sp_true_ev = true_instance_sp[a_sp:b_sp]
+                sp_pred_ev = sp_clusters[a_sp:b_sp]
+                
+                ari_ev, nmi_ev = compute_ari_nmi(sp_true_ev, sp_pred_ev)
+                pq_result = compute_pq(sp_true_ev, sp_pred_ev)
+                if pq_result is not None:
+                    pq_ev = pq_result["PQ"]
 
             if args.max_points is not None and len(x_ev) > args.max_points:
                 pick = maybe_subsample(np.arange(len(x_ev)), args.max_points, rng)
@@ -461,8 +576,8 @@ def main():
             row_titles = [
                 "Semantic Truth (ν vs cosmic)",
                 f"Semantic Prediction (thr={nu_thr:.3f})",
-                "True Instances",
-                "Predicted Clusters"
+                "True Instances (labeled only)",
+                f"Predicted Clusters (thr={args.cluster_distance_thr:.2f})"
             ]
             col_titles = args.plane_names
             pv = args.plane_values
@@ -514,7 +629,11 @@ def main():
 
                 ax = axes[3, c]
                 if cluster_ev is not None:
-                    m_cl = mask_p
+                    # Show only labeled hits in cluster visualization
+                    if y_inst_ev is not None:
+                        m_cl = mask_p & (y_inst_ev >= 0) & (cluster_ev >= 0)
+                    else:
+                        m_cl = mask_p & (cluster_ev >= 0)
                     if m_cl.any():
                         ax.scatter(
                             x_ev[m_cl], y_ev[m_cl],
@@ -531,11 +650,39 @@ def main():
             n_true_cos = int((y_true_ev == 1).sum())
             n_pred_nu = int((y_pred_ev == 0).sum())
             n_pred_cos = int((y_pred_ev == 1).sum())
-            fig.suptitle(
-                f"Event {seen} | truth ν={n_true_nu}, cosmic={n_true_cos} | "
+            
+            # Count clusters and instances (labeled only)
+            if cluster_ev is not None and y_inst_ev is not None:
+                labeled_mask = (y_inst_ev >= 0)
+                n_clusters = len(np.unique(cluster_ev[labeled_mask & (cluster_ev >= 0)]))
+                n_true_inst = len(np.unique(y_inst_ev[labeled_mask]))
+            elif cluster_ev is not None:
+                n_clusters = len(np.unique(cluster_ev[cluster_ev >= 0]))
+                n_true_inst = "N/A"
+            else:
+                n_clusters = "N/A"
+                n_true_inst = "N/A" if y_inst_ev is None else len(np.unique(y_inst_ev[y_inst_ev >= 0]))
+            
+            # Build title with metrics
+            title_parts = [
+                f"Event {seen}",
+                f"truth ν={n_true_nu}, cosmic={n_true_cos}",
                 f"pred ν={n_pred_nu}, cosmic={n_pred_cos}",
-                fontsize=11
-            )
+                f"inst={n_true_inst}, clusters={n_clusters}"
+            ]
+            
+            # Add ARI/PQ if available
+            metrics_str = ""
+            if ari_ev is not None:
+                metrics_str += f"ARI={ari_ev:.2f}"
+            if pq_ev is not None:
+                if metrics_str:
+                    metrics_str += ", "
+                metrics_str += f"PQ={pq_ev:.2f}"
+            if metrics_str:
+                title_parts.append(metrics_str)
+            
+            fig.suptitle(" | ".join(title_parts), fontsize=9)
 
             outfile = outdir / f"{args.split}_event_byplane_{seen:06d}.png"
 
@@ -559,8 +706,8 @@ if __name__ == "__main__":
     except Exception:
         traceback.print_exc()
         try:
-            Path("event_viz_by_plane").mkdir(parents=True, exist_ok=True)
-            Path("event_viz_by_plane/_FATAL.txt").write_text("".join(traceback.format_exc()))
+            Path("event_viz_by_plane_v3").mkdir(parents=True, exist_ok=True)
+            Path("event_viz_by_plane_v3/_FATAL.txt").write_text("".join(traceback.format_exc()))
         except Exception:
             pass
         sys.exit(1)

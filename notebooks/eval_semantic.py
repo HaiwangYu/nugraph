@@ -1,5 +1,15 @@
 #!/usr/bin/env python
 # notebooks/eval_semantic.py
+"""
+Evaluate NuGraph4 semantic and instance segmentation performance.
+
+FIXED VERSION with corrections for:
+- Variable naming bug in collect_edge_split (batch -> b)
+- Edge prediction retrieval from correct store (SP node store, not edge store)
+- Added debug output for first batch
+- Length mismatch handling between ground truth and predictions
+- Added --in-features argument to match training transform
+"""
 import os
 import argparse
 from collections import Counter
@@ -84,7 +94,19 @@ def parse_args():
         default=0,
         help="Index of the 'nu' class inside semantic_classes (default 0).",
     )
-    p.add_argument("--model", default="nugraph3", choices=["nugraph3", "nugraph4"])
+    p.add_argument("--model", default="nugraph4", choices=["nugraph3", "nugraph4"])
+    
+    # NEW: in_features to match training transform
+    p.add_argument(
+        "--in-features",
+        type=int,
+        default=None,
+        help=(
+            "Number of input features for the transform. "
+            "If not set, will try to read from checkpoint hparams. "
+            "MUST match the value used during training (e.g., 4 or 18)."
+        ),
+    )
 
     # === EDGE EVAL OPTIONS ===================================================
     p.add_argument(
@@ -120,16 +142,23 @@ def make_datamodule(
     min_nu_hits=None,
     nu_cut_plane="any",
     nu_class_index=0,
+    in_features=None,
 ):
     Data = ng.data.NuGraphDataModule
-    dm = Data(
+    
+    # Build kwargs, only include in_features if provided
+    dm_kwargs = dict(
         model=model_cls,
         data_path=data_path,
-        # neutrino-hit cut args that your DataModule understands
         min_nu_hits=min_nu_hits,
-        # nu_cut_plane=nu_cut_plane,
-        # nu_hit_class_index=nu_class_index,
     )
+    
+    # CRITICAL: Pass in_features to get the same transform as training
+    if in_features is not None:
+        dm_kwargs["in_features"] = in_features
+        print(f"[Info] Using in_features={in_features} for transform (must match training)")
+    
+    dm = Data(**dm_kwargs)
 
     # Optional overrides
     if batch_size is not None and hasattr(dm, "batch_size"):
@@ -141,7 +170,7 @@ def make_datamodule(
 
     dm.setup("test")
 
-    # Small heads-up on what we’re actually evaluating on
+    # Small heads-up on what we're actually evaluating on
     try:
         n_val = len(dm.val_dataset)
         n_test = len(dm.test_dataset)
@@ -171,7 +200,8 @@ def require_hit_x_or_die(batch, expected_width=None):
         raise RuntimeError(
             f"[error] hit.x has width {batch['hit'].x.size(-1)} but model expects "
             f"{expected_width}.\n"
-            "You likely used a different transform; re-create the same DM as training."
+            "You likely used a different transform; re-create the same DM as training.\n"
+            "Try adding --in-features <N> to match your training config."
         )
 
 
@@ -185,11 +215,13 @@ def collect_split(nugraph, loader, device, limit=None, expected_width=None):
       y_true:    numpy int array with labels {0=nu, 1=cosmic}
       y_pred:    argmax predictions (for reference)
       y_score:   p(nu) probabilities
+      evt_id:    global event id per hit (unique across split)
     """
     from tqdm import tqdm
 
     nugraph.eval().to(device)
-    y_true, y_pred, y_score = [], [], []
+    y_true, y_pred, y_score, evt_id = [], [], [], []
+    evt_offset = 0
 
     print("Collecting predictions from the model (semantic)...")
     for i, b in enumerate(tqdm(loader)):
@@ -200,19 +232,58 @@ def collect_split(nugraph, loader, device, limit=None, expected_width=None):
         require_hit_x_or_die(b, expected_width=expected_width)
 
         _loss, _ = nugraph(b, stage="test")
-        p = b["hit"].x_semantic.detach()  # [N, C], probs
+
+        # DEBUG: confirm where semantic predictions actually live
+        if i == 0:
+            for store in ["hit", "sp"]:
+                if store in b.node_types:
+                    has_pred = hasattr(b[store], "x_semantic")
+                    has_y = hasattr(b[store], "y_semantic")
+                    xshape = tuple(b[store].x_semantic.shape) if has_pred else None
+                    yshape = tuple(b[store].y_semantic.shape) if has_y else None
+                    print(
+                        f"[DBG] {store}: has x_semantic={has_pred} shape={xshape} | "
+                        f"has y_semantic={has_y} shape={yshape}"
+                    )
+
+        # Event ids (graph index) within this batch
+        evt = b["hit"].batch.detach()  # [Nhit]
+
+        # IMPORTANT: advance offset per batch, even if we skip due to masks
+        batch_max_evt = int(evt.max().item()) if evt.numel() > 0 else -1
+        next_offset = evt_offset + (batch_max_evt + 1)
+
+        p = b["hit"].x_semantic.detach()  # [N, C], probs or logits
+        p = p.float()
+
+        # If these are logits, convert to probabilities
+        row_sum = p.sum(dim=1)
+        looks_like_probs = (
+            (p.min() >= -1e-3)
+            and (p.max() <= 1.0 + 1e-3)
+            and torch.isfinite(row_sum).all()
+            and (0.9 < row_sum.mean().item() < 1.1)
+        )
+        if not looks_like_probs:
+            p = torch.softmax(p, dim=1)
+
         y = b["hit"].y_semantic.detach()
 
         mask = y >= 0
         if mask.sum() == 0:
+            evt_offset = next_offset
             continue
 
-        y = y[mask].long().cpu().numpy()
-        p = p[mask].cpu().numpy()
+        y_np = y[mask].long().cpu().numpy()
+        p_np = p[mask].cpu().numpy()
+        e_np = (evt[mask].long().cpu().numpy() + evt_offset)
 
-        y_true.append(y)
-        y_pred.append(p.argmax(1))
-        y_score.append(p[:, 0])  # score for class index 0 ('nu')
+        y_true.append(y_np)
+        y_pred.append(p_np.argmax(1))
+        y_score.append(p_np[:, 0])  # p(nu)
+        evt_id.append(e_np)
+
+        evt_offset = next_offset
 
     if not y_true:
         raise RuntimeError(
@@ -222,84 +293,102 @@ def collect_split(nugraph, loader, device, limit=None, expected_width=None):
     y_true = np.concatenate(y_true)
     y_pred = np.concatenate(y_pred)
     y_score = np.concatenate(y_score)
-    return y_true, y_pred, y_score
+    evt_id = np.concatenate(evt_id)
+    return y_true, y_pred, y_score, evt_id
 
 
 # =============================================================================
 # EDGE EVAL HELPERS
 # =============================================================================
-def _get_edge_truth_and_scores_from_batch(batch):
+def _get_sp_supervision_edge_truth_and_scores(batch):
     """
-    After NuGraph4.forward(stage='test'):
-
-      - batch['hit'].edge_index   : [2, E]
-      - batch['hit'].edge_logits  : [E] or [E,1]
-      - batch['hit'].pid or y_instance : [N] (instance IDs, -1 = ignore)
-
-    Build:
-      y_edge_true  : np array of {0,1} (same-instance edge = 1)
-      y_edge_score : np array of predicted prob(edge is same-instance)
+    FIXED VERSION: Reads ground-truth supervision edges and model predictions.
+    
+    Ground truth lives on: batch[('sp','supervision','sp')]
+      - edge_y: [E] ground truth labels (0/1 for different/same instance)
+      - edge_labelable: [E] mask for which edges are labelable
+    
+    Model predictions live on: batch["sp"] (stored by NuGraph4.forward)
+      - edge_logits: [E_valid] logits for labelable edges only
+      - edge_index: [2, E_valid] edge indices for predictions
+    
+    Returns:
+      y_true:  numpy array of ground truth labels for labelable edges
+      y_score: numpy array of predicted probabilities for same-instance
     """
-    if "hit" not in batch.node_types:
+    E = ("sp", "supervision", "sp")
+    
+    # Check edge store exists
+    if E not in batch.edge_types:
         return None, None
 
-    h = batch["hit"]
-
-    if not hasattr(h, "edge_index") or not hasattr(h, "edge_logits"):
-        # Edge head might be disabled or lambda_edge=0.0
+    e = batch[E]
+    
+    # Check ground truth exists
+    if not hasattr(e, "edge_y") or not hasattr(e, "edge_labelable"):
         return None, None
 
-    edge_index = h.edge_index
-    edge_logits = h.edge_logits
+    # Check predictions exist on SP node store (where NuGraph4 stores them)
+    if "sp" not in batch.node_types:
+        return None, None
+    
+    sp = batch["sp"]
+    if not hasattr(sp, "edge_logits"):
+        # Model didn't compute edge predictions (maybe semantic-only run?)
+        return None, None
 
-    # Handle [E,1] vs [E]
-    if edge_logits.dim() > 1:
-        edge_logits = edge_logits.squeeze(-1)
-
-    # Instance IDs: pid preferred, y_instance as fallback
-    y_inst = getattr(h, "pid", None)
-    if y_inst is None:
-        y_inst = getattr(h, "y_instance", None)
-    if y_inst is None:
-        raise RuntimeError(
-            "[edge-eval] Neither 'pid' nor 'y_instance' found on batch['hit']; "
-            "cannot construct edge ground truth."
+    # NuGraph4 stores predictions only for labelable edges
+    pred = sp.edge_logits  # [E_labelable]
+    
+    # Filter ground truth to labelable edges
+    labelable_mask = (e.edge_labelable > 0)
+    if labelable_mask.sum() == 0:
+        return None, None
+    
+    y_true = e.edge_y[labelable_mask].long()
+    
+    # Sanity check: lengths should match
+    if y_true.shape[0] != pred.shape[0]:
+        print(
+            f"[WARNING] Edge prediction length mismatch: "
+            f"y_true={y_true.shape[0]}, pred={pred.shape[0]}"
         )
+        # Take minimum to avoid crash (should investigate if this happens)
+        min_len = min(y_true.shape[0], pred.shape[0])
+        y_true = y_true[:min_len]
+        pred = pred[:min_len]
+    
+    # Ensure pred is 1D
+    pred = pred.float()
+    if pred.dim() > 1:
+        pred = pred.squeeze(-1)
 
-    src, dst = edge_index
-    y_src = y_inst[src]
-    y_dst = y_inst[dst]
+    # Convert logits to probabilities
+    if pred.min().item() < -1e-3 or pred.max().item() > 1.0 + 1e-3:
+        y_score = torch.sigmoid(pred)
+    else:
+        y_score = pred
 
-    valid = (y_src >= 0) & (y_dst >= 0)
-    if valid.sum() == 0:
-        return None, None
-
-    y_src = y_src[valid]
-    y_dst = y_dst[valid]
-    logits = edge_logits[valid]
-
-    y_edge_true = (y_src == y_dst).long()  # 1 if same instance, else 0
-    y_edge_score = torch.sigmoid(logits)
-
-    return y_edge_true.cpu().numpy(), y_edge_score.cpu().numpy()
+    return y_true.cpu().numpy(), y_score.cpu().numpy()
 
 
 @torch.no_grad()
 def collect_edge_split(nugraph, loader, device, limit=None, max_edges=None):
     """
-    Aggregate edge labels + scores over the split.
-
+    FIXED VERSION: Collect edge predictions across the dataset.
+    
     Returns:
-      y_edge_true:  np array of {0,1} (0 = different instance, 1 = same instance)
-      y_edge_score: np array of predicted prob(edge is same-instance)
+      y_edge_true:  np array of {0,1} (0=different instance, 1=same instance)
+      y_edge_score: np array of predicted prob(edge connects same instance)
     """
     from tqdm import tqdm
 
     nugraph.eval().to(device)
     y_true_all = []
     y_score_all = []
-
     total_edges = 0
+    
+    first_batch = True  # For debug output
 
     print("Collecting predictions from the model (edges)...")
     for i, b in enumerate(tqdm(loader)):
@@ -307,10 +396,42 @@ def collect_edge_split(nugraph, loader, device, limit=None, max_edges=None):
             break
 
         b = b.to(device)
-        # This call populates batch['hit'].edge_index / edge_logits via NuGraph4.forward
         _loss, _ = nugraph(b, stage="test")
+        
+        # DEBUG OUTPUT FOR FIRST BATCH
+        if first_batch and "sp" in b.node_types:
+            sp = b["sp"]
+            print("\n" + "="*70)
+            print("[DEBUG] First batch SP store attributes:")
+            print(f"  has edge_logits: {hasattr(sp, 'edge_logits')}")
+            print(f"  has edge_index: {hasattr(sp, 'edge_index')}")
+            if hasattr(sp, 'edge_logits'):
+                print(f"  edge_logits shape: {sp.edge_logits.shape}")
+                print(f"  edge_logits range: [{sp.edge_logits.min():.3f}, {sp.edge_logits.max():.3f}]")
+            if hasattr(sp, 'edge_index'):
+                print(f"  edge_index shape: {sp.edge_index.shape}")
+            
+            E = ("sp", "supervision", "sp")
+            if E in b.edge_types:
+                e = b[E]
+                print(f"\n[DEBUG] Supervision edge store:")
+                if hasattr(e, 'edge_y'):
+                    print(f"  edge_y shape: {e.edge_y.shape}")
+                    print(f"  edge_y distribution: 0={int((e.edge_y==0).sum())}, 1={int((e.edge_y==1).sum())}")
+                else:
+                    print(f"  edge_y: N/A")
+                    
+                if hasattr(e, 'edge_labelable'):
+                    print(f"  edge_labelable shape: {e.edge_labelable.shape}")
+                    print(f"  labelable edges: {int((e.edge_labelable > 0).sum())}")
+                else:
+                    print(f"  edge_labelable: N/A")
+            print("="*70 + "\n")
+            first_batch = False
 
-        y_edge_true, y_edge_score = _get_edge_truth_and_scores_from_batch(b)
+        # FIXED: Changed 'batch' to 'b' (was causing NameError)
+        y_edge_true, y_edge_score = _get_sp_supervision_edge_truth_and_scores(b)
+        
         if y_edge_true is None or y_edge_score is None:
             continue
 
@@ -319,17 +440,24 @@ def collect_edge_split(nugraph, loader, device, limit=None, max_edges=None):
 
         total_edges += int(y_edge_true.shape[0])
         if (max_edges is not None) and (total_edges >= max_edges):
-            # We still finish this batch, but will downsample globally later
+            print(f"\n[Info] Reached max_edges={max_edges}, stopping collection.")
             break
 
     if not y_true_all:
-        raise RuntimeError("No valid edges collected for edge evaluation.")
+        raise RuntimeError(
+            "No valid edges collected for edge evaluation. "
+            "Possible reasons:\n"
+            "  1. Model checkpoint is from Phase 1 (lambda_edge=0, no edge training)\n"
+            "  2. No supervision edges in the dataset\n"
+            "  3. Model didn't store edge_logits (check forward() implementation)"
+        )
 
     y_edge_true = np.concatenate(y_true_all)
     y_edge_score = np.concatenate(y_score_all)
 
-    # If we hit max_edges, randomly downsample so metrics are unbiased-ish
+    # Subsample if we collected more than max_edges
     if (max_edges is not None) and (y_edge_true.shape[0] > max_edges):
+        print(f"[Info] Subsampling {y_edge_true.shape[0]} edges down to {max_edges}")
         idx = np.random.choice(y_edge_true.shape[0], size=max_edges, replace=False)
         y_edge_true = y_edge_true[idx]
         y_edge_score = y_edge_score[idx]
@@ -338,30 +466,40 @@ def collect_edge_split(nugraph, loader, device, limit=None, max_edges=None):
 
 
 def report_edge_metrics(y_true, y_score, edge_thr, split_name):
-    """
-    Print ROC-AUC, PR-AUC, and thresholded confusion for the edge head.
-    """
-    print(f"\n[{split_name}] EDGE METRICS (same-instance edge = positive)")
+    """Report comprehensive edge classification metrics."""
+    print("\n" + "="*70)
+    print(f"[{split_name}] EDGE METRICS (same-instance edge = positive)")
+    print("="*70)
+    
     pos_frac = float((y_true == 1).mean())
-    print(f"Total edges: {len(y_true)}  |  positive fraction: {pos_frac:.4f}")
+    neg_frac = 1.0 - pos_frac
+    print(f"Total edges: {len(y_true)}")
+    print(f"  Positive (same-instance): {int((y_true==1).sum())} ({pos_frac:.4f})")
+    print(f"  Negative (diff-instance): {int((y_true==0).sum())} ({neg_frac:.4f})")
+    print(f"  Class imbalance ratio (neg:pos): {neg_frac/pos_frac:.2f}:1")
 
+    # ROC-AUC and PR-AUC
     try:
         auc = roc_auc_score(y_true, y_score)
-    except ValueError:
-        auc = float("nan")
+        print(f"\nROC-AUC  (edge): {auc:.4f}")
+    except ValueError as e:
+        print(f"\nROC-AUC  (edge): N/A ({e})")
+    
     try:
         ap = average_precision_score(y_true, y_score)
-    except ValueError:
-        ap = float("nan")
+        print(f"PR-AUC   (edge): {ap:.4f}")
+    except ValueError as e:
+        print(f"PR-AUC   (edge): N/A ({e})")
 
-    print(f"ROC-AUC  (edge): {auc:.4f}")
-    print(f"PR-AUC   (edge): {ap:.4f}")
-
-    # Thresholded summary
+    # Thresholded metrics
     y_pred = (y_score >= edge_thr).astype(int)
     print(f"\n[EDGE] Thresholded at p_same >= {edge_thr:.3f}")
-    print("Confusion matrix (rows=true [0: diff, 1: same], cols=pred):")
-    print(confusion_matrix(y_true, y_pred, labels=[0, 1]))
+    print("Confusion matrix (rows=true, cols=pred):")
+    print("                 pred_diff  pred_same")
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    print(f"  true_diff:  {cm[0,0]:8d}  {cm[0,1]:8d}")
+    print(f"  true_same:  {cm[1,0]:8d}  {cm[1,1]:8d}")
+    
     print("\nClassification report (edges):")
     print(
         classification_report(
@@ -371,6 +509,7 @@ def report_edge_metrics(y_true, y_score, edge_thr, split_name):
             digits=4,
         )
     )
+    print("="*70 + "\n")
 
 
 # =============================================================================
@@ -392,10 +531,10 @@ def report_argmax(y_true, y_pred, y_score, split_name):
     )
     print(
         "\nnu-score stats (mean,std,min,max):",
-        float(y_score.mean()),
-        float(y_score.std()),
-        float(y_score.min()),
-        float(y_score.max()),
+        f"{float(y_score.mean()):.4f}",
+        f"{float(y_score.std()):.4f}",
+        f"{float(y_score.min()):.4f}",
+        f"{float(y_score.max()):.4f}",
     )
 
 
@@ -403,7 +542,6 @@ def report_thresholded(y_true, y_score, nu_thr, header):
     """
     Apply threshold on p(nu). If p(nu) >= nu_thr => predict nu(0), else cosmic(1).
     """
-    y_bin = (y_true == 0).astype(int)  # 1 means "nu-positive"
     y_pred_thr_bin = (y_score >= nu_thr).astype(int)
     y_pred_thr = np.where(y_pred_thr_bin == 1, 0, 1)
 
@@ -424,36 +562,25 @@ def report_thresholded(y_true, y_score, nu_thr, header):
 
 
 def pick_best_f1_threshold(y_true, y_score):
-    """
-    Compute PR curve treating 'nu' as positive, return threshold with best F1.
-    """
     y_bin = (y_true == 0).astype(int)
     prec, rec, thr = precision_recall_curve(y_bin, y_score)
     f1 = 2 * prec * rec / (prec + rec + 1e-12)
-    idx = np.nanargmax(f1[:-1])  # exclude last sentinel
+    idx = np.nanargmax(f1[:-1])
     best_thr = thr[idx] if idx < len(thr) else 0.5
     return best_thr, float(prec[idx]), float(rec[idx])
 
 
 def pick_best_fbeta_threshold(y_true, y_score, beta=0.5):
-    """
-    Compute PR curve and return threshold that maximizes Fβ.
-    β < 1 favors precision; β > 1 favors recall.
-    """
     y_bin = (y_true == 0).astype(int)
     prec, rec, thr = precision_recall_curve(y_bin, y_score)
     beta2 = beta * beta
     fbeta = (1 + beta2) * prec * rec / (beta2 * prec + rec + 1e-12)
-    idx = np.nanargmax(fbeta[:-1])  # exclude last sentinel
+    idx = np.nanargmax(fbeta[:-1])
     best_thr = thr[idx] if idx < len(thr) else 0.5
     return best_thr, float(prec[idx]), float(rec[idx])
 
 
 def plot_pr_curve(y_true, y_score, filename, beta=None):
-    """
-    Plot the precision-recall curve for the 'nu' class.
-    Marks best-F1, and best-Fβ if beta is provided.
-    """
     print(f"\nGenerating Precision-Recall curve for '{filename}'...")
     y_bin = (y_true == 0).astype(int)
     precision, recall, _ = precision_recall_curve(y_bin, y_score)
@@ -467,7 +594,6 @@ def plot_pr_curve(y_true, y_score, filename, beta=None):
     plt.xlim([0, 1.02])
     plt.ylim([0, 1.02])
 
-    # Best F1
     f1_thr, p1, r1 = pick_best_f1_threshold(y_true, y_score)
     plt.plot(
         r1,
@@ -477,7 +603,6 @@ def plot_pr_curve(y_true, y_score, filename, beta=None):
         label=f"Best F1 (thr={f1_thr:.3f})\nP={p1:.2f}, R={r1:.2f}",
     )
 
-    # Best Fβ (optional)
     if beta is not None:
         fbeta_thr, pb, rb = pick_best_fbeta_threshold(y_true, y_score, beta=beta)
         plt.plot(
@@ -493,13 +618,60 @@ def plot_pr_curve(y_true, y_score, filename, beta=None):
     print(f"--> Saved plot to {filename}")
 
 
+def report_event_level(y_true, y_score, evt_id, nu_thr, split_name):
+    """
+    Event is positive if it contains ANY true nu hits (y_true==0).
+    Event is predicted positive if it contains ANY predicted nu hits above threshold.
+    """
+    order = np.argsort(evt_id)
+    evt_id_s = evt_id[order]
+    y_s = y_true[order]
+    s_s = y_score[order]
+
+    uniq, start_idx = np.unique(evt_id_s, return_index=True)
+    start_idx = np.append(start_idx, len(evt_id_s))
+
+    y_evt_true = []
+    y_evt_pred = []
+
+    for i in range(len(uniq)):
+        lo, hi = start_idx[i], start_idx[i + 1]
+        y_e = y_s[lo:hi]
+        s_e = s_s[lo:hi]
+
+        true_event_nu = np.any(y_e == 0)
+        pred_event_nu = np.any(s_e >= nu_thr)
+
+        y_evt_true.append(1 if true_event_nu else 0)
+        y_evt_pred.append(1 if pred_event_nu else 0)
+
+    y_evt_true = np.array(y_evt_true, dtype=int)
+    y_evt_pred = np.array(y_evt_pred, dtype=int)
+
+    print(f"\n[{split_name}] EVENT-LEVEL @thr={nu_thr:.3f}")
+    print(f"Events: {len(y_evt_true)} | true nu-events: {int(y_evt_true.sum())}")
+
+    cm = confusion_matrix(y_evt_true, y_evt_pred, labels=[0, 1])
+    print("Confusion matrix (rows=true [no-nu, nu], cols=pred):")
+    print(cm)
+
+    print("\nClassification report (event-level):")
+    print(
+        classification_report(
+            y_evt_true,
+            y_evt_pred,
+            target_names=["no-nu", "nu"],
+            digits=4,
+        )
+    )
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
 def main():
     args = parse_args()
 
-    # --- import your project exactly as in training ---
     import nugraph as ng
 
     if args.model == "nugraph4":
@@ -507,7 +679,25 @@ def main():
     else:
         Model = ng.models.NuGraph3
 
-    # DataModule exactly as training, now with neutrino-hit cuts forwarded
+    # Try to get in_features from checkpoint if not provided
+    in_features = args.in_features
+    if in_features is None:
+        # Peek at checkpoint to get in_features
+        try:
+            ckpt = torch.load(args.ckpt, map_location="cpu")
+            if "hyper_parameters" in ckpt:
+                in_features = ckpt["hyper_parameters"].get("in_features", None)
+                if in_features is not None:
+                    print(f"[Info] Auto-detected in_features={in_features} from checkpoint")
+        except Exception as e:
+            print(f"[Warning] Could not read in_features from checkpoint: {e}")
+    
+    # If still None, warn and use a default
+    if in_features is None:
+        print("[Warning] in_features not specified and not found in checkpoint.")
+        print("          Using default=4. If this fails, add --in-features <N>.")
+        in_features = 4
+
     dm = make_datamodule(
         ng,
         data_path=args.data_path,
@@ -517,27 +707,29 @@ def main():
         min_nu_hits=args.min_nu_hits,
         # nu_cut_plane=args.nu_cut_plane,
         nu_class_index=args.nu_class_index,
+        in_features=in_features,
     )
 
-    # Load model
     nugraph = Model.load_from_checkpoint(args.ckpt, map_location="cpu")
     print("Loaded checkpoint:", args.ckpt)
+    
+    # Print checkpoint hyperparameters for debugging
+    if hasattr(nugraph, 'hparams'):
+        hparams = nugraph.hparams
+        print("\n[Info] Checkpoint hyperparameters:")
+        for key in ['in_features', 'lambda_edge', 'lambda_embed', 'edge_pos_weight', 'num_iters', 
+                    'use_sp_features', 'use_vtx_features']:
+            if hasattr(hparams, key):
+                print(f"  {key}: {getattr(hparams, key)}")
 
-    # Expected input feature width
-    expected_in_features = getattr(
-        getattr(nugraph, "hparams", None),
-        "in_features",
-        None,
-    )
-    if expected_in_features is None:
-        expected_in_features = 8  # fallback used in training
+    expected_in_features = in_features
 
     loader = dm.val_dataloader() if args.split == "val" else dm.test_dataloader()
 
-    # -------------------------------------------------------------------------
-    # 1) SEMANTIC EVAL
-    # -------------------------------------------------------------------------
-    y_true, y_pred, y_score = collect_split(
+    # =========================================================================
+    # SEMANTIC EVALUATION
+    # =========================================================================
+    y_true, y_pred, y_score, evt_id = collect_split(
         nugraph,
         loader,
         args.device,
@@ -545,22 +737,15 @@ def main():
         expected_width=expected_in_features,
     )
 
-    # Argmax baseline
     report_argmax(y_true, y_pred, y_score, args.split.upper())
 
-    # Thresholded evaluation
-    chosen_thr = None
+    # Choose threshold
     if args.nu_thr is not None:
-        chosen_thr = args.nu_thr
+        chosen_thr = float(args.nu_thr)
         header = f"[{args.split.upper()}] THRESHOLDED (user)"
-        report_thresholded(y_true, y_score, chosen_thr, header=header)
     else:
         if args.beta is not None:
-            chosen_thr, p, r = pick_best_fbeta_threshold(
-                y_true,
-                y_score,
-                beta=args.beta,
-            )
+            chosen_thr, p, r = pick_best_fbeta_threshold(y_true, y_score, beta=args.beta)
             print(
                 f"\nBest-F{args.beta:.2f} ν-threshold found: {chosen_thr:.3f} "
                 f"(precision={p:.3f}, recall={r:.3f})"
@@ -574,34 +759,70 @@ def main():
             )
             header = f"[{args.split.upper()}] THRESHOLDED (best-F1)"
 
-        report_thresholded(y_true, y_score, chosen_thr, header=header)
+    # Report BOTH hit-level thresholded and event-level at the chosen threshold
+    report_thresholded(y_true, y_score, chosen_thr, header=header)
+    report_event_level(y_true, y_score, evt_id, chosen_thr, args.split.upper())
 
-    # Plot PR curve
     plot_filename = os.path.basename(args.ckpt).replace(".ckpt", "_pr_curve.png")
     plot_pr_curve(y_true, y_score, plot_filename, beta=args.beta)
 
-    # -------------------------------------------------------------------------
-    # 2) EDGE EVAL (NuGraph4, optional)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # EDGE EVALUATION (OPTIONAL)
+    # =========================================================================
     if args.eval_edges and args.model == "nugraph4":
-        print("\n[EDGE] Starting edge evaluation using pid/y_instance labels...")
-        y_edge_true, y_edge_score = collect_edge_split(
-            nugraph,
-            loader,
-            args.device,
-            limit=args.limit,
-            max_edges=args.max_edges,
-        )
-        report_edge_metrics(
-            y_edge_true,
-            y_edge_score,
-            args.edge_thr,
-            args.split.upper(),
-        )
+        print("\n" + "="*70)
+        print("[EDGE] Starting edge evaluation using pid/y_instance labels...")
+        print("="*70)
+        
+        # Check if checkpoint actually has edge training
+        if hasattr(nugraph, 'hparams'):
+            lambda_edge = getattr(nugraph.hparams, 'lambda_edge', 0.0)
+            if lambda_edge == 0.0:
+                print(
+                    "\n[WARNING] Checkpoint has lambda_edge=0.0 (no edge training).\n"
+                    "This is likely from Phase 1 (semantic-only). For edge evaluation,\n"
+                    "use a Phase 2 checkpoint with lambda_edge > 0.\n"
+                )
+                print("Skipping edge evaluation.")
+            else:
+                try:
+                    y_edge_true, y_edge_score = collect_edge_split(
+                        nugraph,
+                        loader,
+                        args.device,
+                        limit=args.limit,
+                        max_edges=args.max_edges,
+                    )
+                    report_edge_metrics(
+                        y_edge_true,
+                        y_edge_score,
+                        args.edge_thr,
+                        args.split.upper(),
+                    )
+                except RuntimeError as e:
+                    print(f"\n[ERROR] Edge evaluation failed: {e}")
+        else:
+            # Try anyway if hparams not available
+            try:
+                y_edge_true, y_edge_score = collect_edge_split(
+                    nugraph,
+                    loader,
+                    args.device,
+                    limit=args.limit,
+                    max_edges=args.max_edges,
+                )
+                report_edge_metrics(
+                    y_edge_true,
+                    y_edge_score,
+                    args.edge_thr,
+                    args.split.upper(),
+                )
+            except RuntimeError as e:
+                print(f"\n[ERROR] Edge evaluation failed: {e}")
+                
     elif args.eval_edges:
         print(
-            "\n[EDGE] --eval-edges was set but model!=nugraph4; "
-            "skipping edge eval."
+            "\n[EDGE] --eval-edges was set but model!=nugraph4; skipping edge eval."
         )
 
 
