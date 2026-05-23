@@ -1,6 +1,7 @@
 # filename: nugraph/data/dataset.py
 """NuGraph dataset"""
 from typing import Callable, Optional, List
+import os
 
 import h5py
 import numpy as np
@@ -59,7 +60,7 @@ class NuGraphDataset(Dataset):
         Load one event via NuGraphData, then:
           - move sp/edge_label_index (+ labels) into an edge store as edge_index
           - attach per-hit y_instance from u/v/y/y_instance (if present)
-          - append sidecar semantic features from /sem_features/sp/<event> (if present)
+          - optionally append /sem_features/sp/<event> only when explicitly enabled
           - enforce y_instance[y_semantic==-1] = -1 (ghost masking, in-memory only)
         """
         f = self._get_file()  # <-- NEW: open lazily per process
@@ -123,9 +124,14 @@ class NuGraphDataset(Dataset):
                     hit.y_instance = y_instance
 
         # ------------------------------------------------------------------
-        # (C) Append sidecar semantic features: /sem_features/sp/<event>
+        # (C) Optional sidecar semantic features: /sem_features/sp/<event>
+        #
+        # Default OFF. These were used in earlier experiments and can introduce
+        # truth/geometry leakage if an old sidecar-enriched file is used by
+        # accident. Re-enable only for explicit ablation studies.
         # ------------------------------------------------------------------
-        if hasattr(hit, "x"):
+        enable_sem_sidecar = os.environ.get("NUGRAPH_ENABLE_SEM_SIDECAR", "0").lower()
+        if enable_sem_sidecar in ("1", "true", "yes", "y") and hasattr(hit, "x"):
             N = hit.x.size(0)
             if "sem_features" in f:
                 sf = f["sem_features"]

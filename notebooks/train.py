@@ -144,7 +144,12 @@ def main(args):
     #     torch.cuda.set_device(local_rank % torch.cuda.device_count())
 
 
-    print(f"[Rank {global_rank}] MPI/Env: WORLD_SIZE={world_size}, RANK={global_rank}, LOCAL_RANK={local_rank}")
+    print(
+        f"[Rank {global_rank}] MPI/Env: WORLD_SIZE={world_size}, "
+        f"RANK={global_rank}, LOCAL_RANK={local_rank}, "
+        f"MASTER_ADDR={os.environ.get('MASTER_ADDR')}, "
+        f"MASTER_PORT={os.environ.get('MASTER_PORT')}"
+    )
 
     # Make sure Lightning also sees torchrun-style env
     os.environ["RANK"]       = str(global_rank)
@@ -259,13 +264,25 @@ def main(args):
         )
 
     # === SANITY B: inspect one train batch (transformed) & infer in_features ===
+    # This is useful for single-GPU/debug jobs, but expensive on large MPI jobs
+    # because every rank performs an extra HDF5 read before DDP starts.
     batch = None
-    try:
-        td = nudata.train_dataloader()
-        batch = next(iter(td))  # one batch on each rank
-    except Exception as e:
-        if global_rank == 0:
-            print("[Sanity] Could not inspect a batch:", e)
+    inspect_train_batch = bool(args.inspect_train_batch or world_size == 1)
+    if inspect_train_batch:
+        try:
+            td = nudata.train_dataloader()
+            batch = next(iter(td))
+        except Exception as e:
+            if global_rank == 0:
+                print("[Sanity] Could not inspect a batch:", e)
+    elif global_rank == 0:
+        print(
+            "[Sanity] Skipping pre-training batch inspection for multi-rank job. "
+            "Use --inspect-train-batch to force it."
+        )
+
+    if batch is None and global_rank == 0:
+        print("[Sanity] Skipped feature-dim batch check; relying on transform/model configuration.")
 
     if batch is not None:
         # Print semantic label distribution (rank 0 only)
@@ -307,8 +324,6 @@ def main(args):
             if global_rank == 0:
                 print("[Sanity] Feature-dim hard check failed:", e)
             raise
-
-
 
     model_semantic_classes = getattr(nudata, "semantic_classes", None)
     if args.semantic_head and model_semantic_classes is None:
@@ -546,9 +561,9 @@ if __name__ == "__main__":
                    help="Choose model architecture.")
 
     # --- Model Configuration ---
-    p.add_argument("--in-features", type=int, default=10,
-                   help="Number of input node features (after PositionFeatures; "
-                        "now 5 base + 2 sidecar + 3 pos = 10).")
+    p.add_argument("--in-features", type=int, default=4,
+                   help="Final hit.x feature dimension after transform; current "
+                        "leakage-safe production runs use --in-features 4.")
     p.add_argument("--hit-features", type=int, default=256,
                    help="Dimension of hit node embeddings.")
     p.add_argument("--nexus-features", type=int, default=64,
@@ -646,6 +661,12 @@ if __name__ == "__main__":
         type=float,
         default=1.0,
         help="Fraction of the train split to use (0 < f <= 1.0).",
+    )
+    p.add_argument(
+        "--inspect-train-batch",
+        action="store_true",
+        default=False,
+        help="Force a pre-training transformed batch inspection on every rank.",
     )
 
     args = p.parse_args()

@@ -172,12 +172,19 @@ class NuGraph3(LightningModule):
 
         return total_loss, total_metrics
 
+    def _sync_dist(self) -> bool:
+        try:
+            return int(getattr(self.trainer, "world_size", 1)) > 1
+        except RuntimeError:
+            return False
+
     def training_step(self,
                       batch: Data,
                       batch_idx: int) -> float:
         loss, metrics = self(batch, 'train')
-        self.log('loss/train', loss, batch_size=batch.num_graphs, prog_bar=True)
-        self.log_dict(metrics, batch_size=batch.num_graphs)
+        sync_dist = self._sync_dist()
+        self.log('loss/train', loss, batch_size=batch.num_graphs, prog_bar=True, sync_dist=sync_dist)
+        self.log_dict(metrics, batch_size=batch.num_graphs, sync_dist=sync_dist)
         return loss
 
     def on_train_epoch_end(self) -> None:
@@ -188,8 +195,9 @@ class NuGraph3(LightningModule):
                         batch,
                         batch_idx: int) -> None:
         loss, metrics = self(batch, 'val')
-        self.log('loss/val', loss, batch_size=batch.num_graphs)
-        self.log_dict(metrics, batch_size=batch.num_graphs)
+        sync_dist = self._sync_dist()
+        self.log('loss/val', loss, batch_size=batch.num_graphs, sync_dist=sync_dist)
+        self.log_dict(metrics, batch_size=batch.num_graphs, sync_dist=sync_dist)
 
     def on_validation_epoch_end(self) -> None:
         epoch = self.trainer.current_epoch + 1
@@ -200,8 +208,9 @@ class NuGraph3(LightningModule):
                   batch,
                   batch_idx: int = 0) -> None:
         loss, metrics = self(batch, 'test')
-        self.log('loss/test', loss, batch_size=batch.num_graphs)
-        self.log_dict(metrics, batch_size=batch.num_graphs)
+        sync_dist = self._sync_dist()
+        self.log('loss/test', loss, batch_size=batch.num_graphs, sync_dist=sync_dist)
+        self.log_dict(metrics, batch_size=batch.num_graphs, sync_dist=sync_dist)
 
     def on_test_epoch_end(self) -> None:
         epoch = self.trainer.current_epoch + 1
@@ -224,7 +233,7 @@ class NuGraph3(LightningModule):
         return [optimizer], {'scheduler': onecycle, 'interval': 'step'}
 
     @staticmethod
-    def transform(planes: tuple[str], in_features: int = 10) -> Transform:
+    def transform(planes: tuple[str], in_features: int = 4) -> Transform:
         return Transform(planes, in_features=in_features)
 
 
@@ -239,7 +248,7 @@ class NuGraph3(LightningModule):
         model = parser.add_argument_group('model', 'NuGraph3 model configuration')
         model.add_argument('--num-iters', type=int, default=5,
                            help='Number of message-passing iterations')
-        model.add_argument('--in-feats', type=int, default=10,
+        model.add_argument('--in-feats', type=int, default=4,
                            help='Number of input node features')
         model.add_argument('--hit-feats', type=int, default=128,
                            help='Hidden dimensionality of hit convolutions')

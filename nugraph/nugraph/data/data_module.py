@@ -31,7 +31,7 @@ class NuGraphDataModule(LightningDataModule):
         balance_frac: float = 0.1,
         min_nu_hits: int = 0,
         train_fraction: float = 1.0,
-        in_features: int = 18,   # <-- NEW: final hit.x dim after Transform
+        in_features: int = 4,   # final leakage-safe hit.x dim after Transform
     ):
         super().__init__()
 
@@ -86,7 +86,13 @@ class NuGraphDataModule(LightningDataModule):
             # sample splits
             try:
                 train_samples = f["samples/train"].asstr()[()]
-                val_samples = f["samples/validation"].asstr()[()]
+                if "samples/validation" in f:
+                    val_samples = f["samples/validation"].asstr()[()]
+                elif "samples/val" in f:
+                    print("[Data] Using samples/val as validation split.")
+                    val_samples = f["samples/val"].asstr()[()]
+                else:
+                    raise KeyError("samples/validation")
                 test_samples = f["samples/test"].asstr()[()]
             except KeyError as e:
                 raise RuntimeError(
@@ -95,7 +101,13 @@ class NuGraphDataModule(LightningDataModule):
 
             # datasize/train (for BalanceSampler)
             try:
-                self.train_datasize = f["datasize/train"][()]
+                if "datasize/train" in f:
+                    self.train_datasize = f["datasize/train"][()]
+                elif "datasize" in f and isinstance(f["datasize"], h5py.Dataset):
+                    print("[Data] datasize is split counts; using unit train sizes for random/weighted sampling.")
+                    self.train_datasize = np.ones(len(train_samples), dtype=np.int64)
+                else:
+                    raise KeyError("datasize/train")
             except KeyError as e:
                 raise RuntimeError(
                     'Data size array not found in file! Call "generate_samples" to create it.'

@@ -14,7 +14,7 @@ class Transform(BaseTransform):
         in_features: total feature dimension expected by the model AFTER transform
                      (i.e. final hit.x dimension fed into Encoder)
     """
-    def __init__(self, planes: tuple[str], in_features: int = 10):
+    def __init__(self, planes: tuple[str], in_features: int = 4):
         super().__init__()
         self.planes = planes
         self.in_features = int(in_features)

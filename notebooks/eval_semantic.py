@@ -17,6 +17,7 @@ from collections import Counter
 import numpy as np
 import torch
 from sklearn.metrics import (
+    adjusted_rand_score,
     classification_report,
     confusion_matrix,
     precision_recall_curve,
@@ -38,7 +39,7 @@ def parse_args():
         required=True,
         help="HDF5 used in training (same file as train.py)",
     )
-    p.add_argument("--split", default="val", choices=["val", "test"])
+    p.add_argument("--split", default="val", choices=["val", "validation", "test"])
     p.add_argument(
         "--limit",
         type=int,
@@ -115,10 +116,24 @@ def parse_args():
         help="If set (and model=nugraph4), also evaluate edge head using pid/y_instance.",
     )
     p.add_argument(
+        "--eval-instances",
+        action="store_true",
+        help=(
+            "If set (and model=nugraph4), cluster SP nodes from predicted same-instance "
+            "edges and report ARI/purity/completeness against sp/y_instance."
+        ),
+    )
+    p.add_argument(
         "--edge-thr",
         type=float,
         default=0.5,
-        help="Threshold on edge prob for binary edge predictions (same-instance=1).",
+        help="Threshold on edge prob for binary edge predictions / SP clustering.",
+    )
+    p.add_argument(
+        "--min-cluster-size",
+        type=int,
+        default=2,
+        help="Minimum connected-component size kept as a cluster for instance metrics.",
     )
     p.add_argument(
         "--max-edges",
@@ -131,6 +146,10 @@ def parse_args():
     )
     # ========================================================================
     return p.parse_args()
+
+
+def normalize_split(split):
+    return "val" if split == "validation" else split
 
 
 def make_datamodule(
@@ -513,6 +532,198 @@ def report_edge_metrics(y_true, y_score, edge_thr, split_name):
 
 
 # =============================================================================
+# INSTANCE CLUSTERING EVAL HELPERS
+# =============================================================================
+class UnionFind:
+    def __init__(self, n):
+        self.parent = list(range(n))
+        self.size = [1] * n
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra = self.find(a)
+        rb = self.find(b)
+        if ra == rb:
+            return
+        if self.size[ra] < self.size[rb]:
+            ra, rb = rb, ra
+        self.parent[rb] = ra
+        self.size[ra] += self.size[rb]
+
+
+def purity_completeness(y_true, y_pred):
+    t_unique, t_inv = np.unique(y_true, return_inverse=True)
+    p_unique, p_inv = np.unique(y_pred, return_inverse=True)
+    contingency = np.zeros((t_unique.size, p_unique.size), dtype=np.int64)
+    for ti, pi in zip(t_inv, p_inv):
+        contingency[ti, pi] += 1
+
+    total = contingency.sum()
+    if total == 0:
+        return np.nan, np.nan
+
+    purity = contingency.max(axis=0).sum() / total
+    completeness = contingency.max(axis=1).sum() / total
+    return purity, completeness
+
+
+def clusters_from_edges(num_nodes, edge_index, edge_score, edge_thr, min_cluster_size):
+    uf = UnionFind(num_nodes)
+    keep = edge_score >= edge_thr
+    if keep.any():
+        for src, dst in edge_index[:, keep].T.tolist():
+            uf.union(int(src), int(dst))
+
+    roots = np.array([uf.find(i) for i in range(num_nodes)], dtype=np.int64)
+    counts = Counter(roots.tolist())
+    pred = np.empty_like(roots)
+    remap = {}
+    next_id = 0
+    for i, root in enumerate(roots):
+        root = int(root)
+        if counts[root] < min_cluster_size:
+            pred[i] = next_id
+            next_id += 1
+        else:
+            if root not in remap:
+                remap[root] = next_id
+                next_id += 1
+            pred[i] = remap[root]
+    return pred
+
+
+@torch.no_grad()
+def collect_instance_cluster_metrics(
+    nugraph,
+    loader,
+    device,
+    edge_thr,
+    min_cluster_size=2,
+    limit=None,
+):
+    from tqdm import tqdm
+
+    nugraph.eval().to(device)
+
+    total_points = 0
+    weighted_ari = 0.0
+    weighted_purity = 0.0
+    weighted_completeness = 0.0
+    graphs_used = 0
+
+    print("Collecting predictions from the model (SP instance clusters)...")
+    for i, b in enumerate(tqdm(loader)):
+        if limit is not None and i >= limit:
+            break
+
+        b = b.to(device)
+        _loss, _ = nugraph(b, stage="test")
+
+        if "sp" not in b.node_types:
+            continue
+        sp = b["sp"]
+        if not hasattr(sp, "edge_logits") or not hasattr(sp, "edge_index"):
+            continue
+        if not hasattr(sp, "y_instance"):
+            raise RuntimeError("SP store has no y_instance; cannot evaluate instance clusters.")
+
+        edge_logits = sp.edge_logits.float()
+        if edge_logits.dim() > 1:
+            edge_logits = edge_logits.squeeze(-1)
+        if edge_logits.min().item() < -1e-3 or edge_logits.max().item() > 1.0 + 1e-3:
+            edge_score = torch.sigmoid(edge_logits).detach().cpu().numpy()
+        else:
+            edge_score = edge_logits.detach().cpu().numpy()
+        edge_index = sp.edge_index.detach().cpu().numpy()
+        y_instance = sp.y_instance.detach().cpu().numpy().astype(np.int64)
+
+        if hasattr(sp, "batch"):
+            batch_index = sp.batch.detach().cpu().numpy().astype(np.int64)
+        else:
+            num_sp_nodes = int(getattr(sp, "num_nodes", y_instance.shape[0]))
+            batch_index = np.zeros(num_sp_nodes, dtype=np.int64)
+
+        for graph_id in np.unique(batch_index):
+            node_mask = batch_index == graph_id
+            node_idx = np.flatnonzero(node_mask)
+            if node_idx.size < 2:
+                continue
+
+            local = {int(global_idx): local_idx for local_idx, global_idx in enumerate(node_idx)}
+            edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
+            if not edge_mask.any():
+                continue
+
+            edge_index_g_global = edge_index[:, edge_mask]
+            edge_score_g = edge_score[edge_mask]
+            edge_index_g = np.array(
+                [[local[int(src)], local[int(dst)]] for src, dst in edge_index_g_global.T],
+                dtype=np.int64,
+            ).T
+
+            y_true = y_instance[node_idx]
+            labeled = y_true >= 0
+            if labeled.sum() < 2 or np.unique(y_true[labeled]).size < 2:
+                continue
+
+            y_pred_all = clusters_from_edges(
+                num_nodes=node_idx.size,
+                edge_index=edge_index_g,
+                edge_score=edge_score_g,
+                edge_thr=edge_thr,
+                min_cluster_size=min_cluster_size,
+            )
+
+            y_true_labeled = y_true[labeled]
+            y_pred_labeled = y_pred_all[labeled]
+            weight = int(labeled.sum())
+
+            ari = adjusted_rand_score(y_true_labeled, y_pred_labeled)
+            purity, completeness = purity_completeness(y_true_labeled, y_pred_labeled)
+            if np.isnan(purity) or np.isnan(completeness):
+                continue
+
+            graphs_used += 1
+            total_points += weight
+            weighted_ari += ari * weight
+            weighted_purity += purity * weight
+            weighted_completeness += completeness * weight
+
+    if graphs_used == 0 or total_points == 0:
+        raise RuntimeError(
+            "No graphs contributed to instance clustering metrics. "
+            "Check --edge-thr, --limit, and that the checkpoint has lambda_edge > 0."
+        )
+
+    return {
+        "graphs_used": graphs_used,
+        "total_labeled_sp": total_points,
+        "ari": weighted_ari / total_points,
+        "purity": weighted_purity / total_points,
+        "completeness": weighted_completeness / total_points,
+    }
+
+
+def report_instance_cluster_metrics(metrics, edge_thr, min_cluster_size, split_name):
+    print("\n" + "="*70)
+    print(f"[{split_name}] SP INSTANCE CLUSTERING METRICS")
+    print("="*70)
+    print(f"Graphs used:            {metrics['graphs_used']}")
+    print(f"Total labeled SP:       {metrics['total_labeled_sp']}")
+    print(f"Edge threshold p_same:  {edge_thr:.3f}")
+    print(f"Min cluster size:       {min_cluster_size}")
+    print(f"Weighted ARI:           {metrics['ari']:.4f}")
+    print(f"Weighted purity:        {metrics['purity']:.4f}")
+    print(f"Weighted completeness:  {metrics['completeness']:.4f}")
+    print("="*70 + "\n")
+
+
+# =============================================================================
 # SEMANTIC REPORT HELPERS
 # =============================================================================
 def report_argmax(y_true, y_pred, y_score, split_name):
@@ -671,6 +882,8 @@ def report_event_level(y_true, y_score, evt_id, nu_thr, split_name):
 # =============================================================================
 def main():
     args = parse_args()
+    split = normalize_split(args.split)
+    split_name = split.upper()
 
     import nugraph as ng
 
@@ -724,7 +937,7 @@ def main():
 
     expected_in_features = in_features
 
-    loader = dm.val_dataloader() if args.split == "val" else dm.test_dataloader()
+    loader = dm.val_dataloader() if split == "val" else dm.test_dataloader()
 
     # =========================================================================
     # SEMANTIC EVALUATION
@@ -737,12 +950,12 @@ def main():
         expected_width=expected_in_features,
     )
 
-    report_argmax(y_true, y_pred, y_score, args.split.upper())
+    report_argmax(y_true, y_pred, y_score, split_name)
 
     # Choose threshold
     if args.nu_thr is not None:
         chosen_thr = float(args.nu_thr)
-        header = f"[{args.split.upper()}] THRESHOLDED (user)"
+        header = f"[{split_name}] THRESHOLDED (user)"
     else:
         if args.beta is not None:
             chosen_thr, p, r = pick_best_fbeta_threshold(y_true, y_score, beta=args.beta)
@@ -750,20 +963,20 @@ def main():
                 f"\nBest-F{args.beta:.2f} ν-threshold found: {chosen_thr:.3f} "
                 f"(precision={p:.3f}, recall={r:.3f})"
             )
-            header = f"[{args.split.upper()}] THRESHOLDED (best-F{args.beta:.2f})"
+            header = f"[{split_name}] THRESHOLDED (best-F{args.beta:.2f})"
         else:
             chosen_thr, p, r = pick_best_f1_threshold(y_true, y_score)
             print(
                 f"\nBest-F1 ν-threshold found: {chosen_thr:.3f} "
                 f"(precision={p:.3f}, recall={r:.3f})"
             )
-            header = f"[{args.split.upper()}] THRESHOLDED (best-F1)"
+            header = f"[{split_name}] THRESHOLDED (best-F1)"
 
     # Report BOTH hit-level thresholded and event-level at the chosen threshold
     report_thresholded(y_true, y_score, chosen_thr, header=header)
-    report_event_level(y_true, y_score, evt_id, chosen_thr, args.split.upper())
+    report_event_level(y_true, y_score, evt_id, chosen_thr, split_name)
 
-    plot_filename = os.path.basename(args.ckpt).replace(".ckpt", "_pr_curve.png")
+    plot_filename = f"{split}_{os.path.basename(args.ckpt).replace('.ckpt', '_pr_curve.png')}"
     plot_pr_curve(y_true, y_score, plot_filename, beta=args.beta)
 
     # =========================================================================
@@ -797,7 +1010,7 @@ def main():
                         y_edge_true,
                         y_edge_score,
                         args.edge_thr,
-                        args.split.upper(),
+                        split_name,
                     )
                 except RuntimeError as e:
                     print(f"\n[ERROR] Edge evaluation failed: {e}")
@@ -815,7 +1028,7 @@ def main():
                     y_edge_true,
                     y_edge_score,
                     args.edge_thr,
-                    args.split.upper(),
+                    split_name,
                 )
             except RuntimeError as e:
                 print(f"\n[ERROR] Edge evaluation failed: {e}")
@@ -823,6 +1036,48 @@ def main():
     elif args.eval_edges:
         print(
             "\n[EDGE] --eval-edges was set but model!=nugraph4; skipping edge eval."
+        )
+
+    # =========================================================================
+    # INSTANCE CLUSTERING EVALUATION (OPTIONAL)
+    # =========================================================================
+    if args.eval_instances and args.model == "nugraph4":
+        print("\n" + "="*70)
+        print("[INSTANCE] Starting SP instance clustering evaluation...")
+        print("="*70)
+
+        lambda_edge = 0.0
+        lambda_coh = 0.0
+        if hasattr(nugraph, "hparams"):
+            lambda_edge = float(getattr(nugraph.hparams, "lambda_edge", 0.0))
+            lambda_coh = float(getattr(nugraph.hparams, "lambda_coh", 0.0))
+
+        if lambda_edge == 0.0 and lambda_coh == 0.0:
+            print(
+                "\n[WARNING] Checkpoint appears to have no edge/cohesion head enabled "
+                "(lambda_edge=0 and lambda_coh=0). Skipping instance clustering."
+            )
+        else:
+            try:
+                instance_metrics = collect_instance_cluster_metrics(
+                    nugraph,
+                    loader,
+                    args.device,
+                    edge_thr=args.edge_thr,
+                    min_cluster_size=args.min_cluster_size,
+                    limit=args.limit,
+                )
+                report_instance_cluster_metrics(
+                    instance_metrics,
+                    args.edge_thr,
+                    args.min_cluster_size,
+                    split_name,
+                )
+            except RuntimeError as e:
+                print(f"\n[ERROR] Instance clustering evaluation failed: {e}")
+    elif args.eval_instances:
+        print(
+            "\n[INSTANCE] --eval-instances was set but model!=nugraph4; skipping instance eval."
         )
 
 
