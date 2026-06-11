@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wire-Cell → NuGraph conversion (pywcml)</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  :root{
+    --bg:#f6f8fa; --panel:#ffffff; --panel2:#eef2f6; --ink:#1c2530; --muted:#5a6675;
+    --line:#d4dbe3; --accent:#0969da;
+    --hit:#1f6feb; --sp:#8250df; --evt:#d4690a; --enc:#1a7f5a; --core:#b8860b;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 22px 80px;}
+  h1{font-size:30px;margin:0 0 6px;letter-spacing:-.5px;color:#0d1117}
+  h2{font-size:22px;margin:46px 0 14px;padding-bottom:8px;border-bottom:1px solid var(--line);color:#0d1117}
+  h3{font-size:17px;margin:26px 0 8px;color:var(--accent)}
+  .sub{color:var(--muted);margin:0 0 8px}
+  p{color:#34404d}
+  a{color:var(--accent)}
+  code{background:#f0f3f6;border:1px solid var(--line);border-radius:5px;padding:1px 6px;
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:#9a4a00}
+  pre{background:#f0f3f6;border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow:auto;
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:12.5px;color:#243; line-height:1.5}
+  pre code{background:none;border:none;padding:0;color:inherit;font-size:inherit}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:8px 22px;margin:16px 0;
+    box-shadow:0 1px 3px rgba(27,37,48,.06);}
+  table{width:100%;border-collapse:collapse;margin:12px 0;font-size:13px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--panel2);color:var(--accent);font-weight:600}
+  tr:nth-child(even) td{background:#f7f9fb}
+  .note{border-left:3px solid var(--accent);background:#eaf3fb;padding:12px 16px;border-radius:0 8px 8px 0;margin:14px 0;color:#234}
+  .warn{border-left:3px solid #d4690a;background:#fdf3e7;color:#4a3411}
+  .mono{font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  .mermaid{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:18px;margin:16px 0;
+    box-shadow:0 1px 3px rgba(27,37,48,.06);text-align:center}
+  ul{margin:8px 0;padding-left:22px} li{margin:4px 0;color:#34404d}
+  .small{font-size:12.5px;color:var(--muted)}
+  .pill{font-family:"SF Mono",monospace;font-size:12px;background:#eef2f6;border:1px solid var(--line);border-radius:5px;padding:1px 6px;color:#234}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Wire-Cell → NuGraph conversion (<code>pywcml</code>)</h1>
+  <p class="sub">How Wire-Cell ML <b>blobs</b>, <b>measurements (CTPC)</b>, and <b>point-point edges</b> become
+  NuGraph <b>hit</b> / <b>sp</b> nodes and the edges between them.</p>
+  <p>Source: <code>pywcml/{io.py, geometry.py, config.py, converter.py}</code> — <code>WCMLConverter._build_graph()</code>
+  is the heart of it. The result is one <code>NuGraphData</code> heterogeneous graph per event, saved into an HDF5 dataset
+  that <code>H5DataModule</code> feeds to NuGraph3 / NuGraph4.</p>
+
+  <!-- ================= 1 ================= -->
+  <h2>1 · Terminology map</h2>
+  <div class="card">
+  <table>
+    <tr><th>Wire-Cell object</th><th>NuGraph object</th><th>What it is</th></tr>
+    <tr><td><b>blob</b> (3D charge blob)</td><td><b style="color:var(--sp)">sp node</b> (spacepoint / "nexus")</td><td>one 3D reconstructed charge volume; centroid of its corners</td></tr>
+    <tr><td><b>CTPC stripe</b> (contiguous wire-plane charge)</td><td><b style="color:var(--hit)">hit node</b> (per plane u/v/y)</td><td>a charge-weighted cluster of wire-plane measurements</td></tr>
+    <tr><td><b>point</b> (<code>points</code> rows)</td><td>— (bookkeeping only)</td><td>3D space point; carries <code>blob_id</code> + reco-cluster id, links truth</td></tr>
+    <tr><td><b>ppedges</b> (point↔point)</td><td><b>(sp, nexus, sp)</b> edges</td><td>message-passing graph between blobs</td></tr>
+    <tr><td><b>edge_index</b> (point↔point, truth)</td><td><b>(sp, supervision, sp)</b> edges</td><td>labelled "same-instance?" edges</td></tr>
+    <tr><td>blob ↔ CTPC stripe geometric match</td><td><b>(hit, nexus, sp)</b> edges</td><td>which plane hits feed which 3D blob</td></tr>
+    <tr><td>Delaunay over hit positions</td><td><b>(hit, plane, hit)</b> edges</td><td>intra-plane neighbour graph</td></tr>
+  </table>
+  </div>
+  <div class="note warn"><b>Naming gotcha.</b> In NuGraph a <code>hit</code> node is <b>not</b> a single Wire-Cell hit — it is a
+  <i>cluster of CTPC measurements</i> on one wire plane. The 3D <code>sp</code> node is the <i>blob</i>. Keep this mapping in mind throughout.</div>
+
+  <!-- ================= 2 ================= -->
+  <h2>2 · Input: the NPZ arrays (<code>io.py</code>)</h2>
+  <p><code>load_npz()</code> reads one <code>rec-lab-*.npz</code> into a <code>WCMLArrays</code> bundle:</p>
+  <div class="card">
+  <table>
+    <tr><th>Array</th><th>Shape</th><th>Columns / meaning</th></tr>
+    <tr><td class="mono">blobs</td><td>(N_blob, ·)</td><td><code>[0]=charge, [1]=n_corners, [2:2+3·n_corners]=corner xyz…</code></td></tr>
+    <tr><td class="mono">points</td><td>(N_pt, ≥6)</td><td>3D points; <code>[:,4]=blob_id</code>, <code>[:,5]=reco_cluster_id</code></td></tr>
+    <tr><td class="mono">ctpc_*</td><td>(N_ctpc, 4)</td><td>per plane: <code>[0]=x(drift), [1]=pitch/wire, [2]=charge, [3]=charge_err</code></td></tr>
+    <tr><td class="mono">is_nu</td><td>(N_pt,)</td><td>per-<b>point</b> truth: <code>1</code>=ν (signal), <code>0</code>=cosmic, <code>-2</code>=unmatched/ghost</td></tr>
+    <tr><td class="mono">ppedges</td><td>(N_e, ≥2)</td><td><code>[:,0],[:,1]</code> = head/tail <b>point</b> indices</td></tr>
+    <tr><td class="mono">edge_index</td><td>(2, E)</td><td>truth supervision edges, <b>point</b> indices</td></tr>
+    <tr><td class="mono">vtx_dist/dx/dy/dz</td><td>(N_pt,)</td><td>optional per-point neutrino-vertex geometry (cm)</td></tr>
+  </table>
+  </div>
+  <p>Everything downstream is an <b>aggregation of points / CTPC up to the blob (sp) or stripe (hit) level.</b></p>
+
+  <!-- ================= 3 ================= -->
+  <h2>3 · <span style="color:var(--sp)">sp</span> nodes — one per blob</h2>
+  <p>Built in <code>_build_graph()</code> from <code>_extract_blobs()</code>:</p>
+  <pre><code>blobs[i] = [charge_i, n_corners_i, x0,y0,z0, x1,y1,z1, …]
+       ──► corners_i  = reshape(n_corners_i, 3)
+           centroid_i = mean(corners_i, axis=0)          # 3D position (mm)</code></pre>
+  <div class="card">
+  <table>
+    <tr><th>sp attribute</th><th>Source</th></tr>
+    <tr><td class="mono">sp.pos (N,3)</td><td>blob <b>centroid</b> (mean of corners)</td></tr>
+    <tr><td class="mono">sp.features (N,6)</td><td><code>[charge, reco_cluster_id, vtx_dist, vtx_dx, vtx_dy, vtx_dz]</code></td></tr>
+    <tr><td class="mono">sp.y_semantic (N,)</td><td>per-blob class: <code>0=nu, 1=cosmic, -1=ghost</code> (see §6)</td></tr>
+    <tr><td class="mono">sp.y_instance (N,)</td><td><code>truth_blob_tid</code> if present, else reco-cluster id; <code>-1</code> on ghosts</td></tr>
+  </table>
+  </div>
+  <ul>
+    <li><b>charge</b> = <code>blobs[:,0]</code>.</li>
+    <li><b>reco_cluster_id</b> = per-blob <i>mode</i> of <code>points[:,5]</code> (<code>_reco_cluster_by_blob</code>).</li>
+    <li><b>vtx_*</b> = mean over the blob's hits of the per-point vertex quantities, cm→mm (only trusted when <code>nu_vtx_found</code>); <b>zeroed / -1 on ghost blobs</b> so truth can't leak.</li>
+  </ul>
+
+  <!-- ================= 4 ================= -->
+  <h2>4 · <span style="color:var(--hit)">hit</span> nodes — CTPC stripes per plane (<code>_build_plane</code>)</h2>
+  <p>Each plane (<code>u</code>, <code>v</code>, <code>y</code>) is processed independently. A <code>hit</code> node is a
+  <b>contiguous run of CTPC measurements</b> at one drift position:</p>
+
+  <div class="mermaid">
+flowchart TD
+    A["ctpc_plane rows<br/>[x, pitch, charge, charge_err]"] --> B["sort by x (drift)"]
+    B --> C["group rows with<br/>|Δx| ≤ x_tolerance (5 mm)"]
+    C --> D["within a group sort by pitch,<br/>split where gap > pitch_gap_tolerance (6 mm)"]
+    D --> E["each contiguous stripe = one hit node"]
+    E --> F["charge-weighted centroid (wx, wy)<br/>features: total_charge, mean_charge_err,<br/>nhits, pitch_min, pitch_max"]
+  </div>
+
+  <div class="card">
+  <table>
+    <tr><th>hit attribute</th><th>Source</th></tr>
+    <tr><td class="mono">pos (M,2)</td><td>charge-weighted <code>(wx, wy)</code> of the stripe's CTPC rows</td></tr>
+    <tr><td class="mono">x (features)</td><td><code>[total_charge, mean_charge_err, nhits, pitch_min, pitch_max]</code> <b>+ 4 vertex + 6 sidecar</b> = 15 cols</td></tr>
+    <tr><td class="mono">y_semantic (M,)</td><td>propagated from linked blobs (positive wins)</td></tr>
+    <tr><td class="mono">y_instance (M,)</td><td><i>mode</i> of linked blob truth-instance ids</td></tr>
+  </table>
+  </div>
+  <p class="small">Sidecar/vertex columns are zeros unless explicitly enabled (<code>enable_sidecar_features</code>, etc.).
+  The model only consumes a leading slice of these (Transform trims <code>hit.x</code> to <code>in_features</code>).</p>
+
+  <!-- ================= 5 ================= -->
+  <h2>5 · Edges</h2>
+
+  <h3>5.1 (hit, plane, hit) — intra-plane Delaunay</h3>
+  <p><code>geometry.triangulation_edges(pos_array)</code> runs a 2D Delaunay triangulation over the plane's hit
+  positions and keeps the unique undirected triangle edges (falls back to a complete graph for degenerate/tiny sets).
+  → <code>graph[plane,"plane",plane].edge_index</code>.</p>
+
+  <h3>5.2 (hit, nexus, sp) — hit ↔ blob association</h3>
+  <p>For every blob, its 3D corners are <b>projected into the plane coordinate</b> via
+  <code>project_corners(corners, angle)</code> = <span class="mono">cos θ·z − sin θ·y</span> (θ from <code>PlaneSpec</code>).
+  A hit node links to that blob when <b>both</b> hold:</p>
+  <ul>
+    <li><b>drift match</b>: <code>|hit.x − blob_centroid.x| ≤ x_tolerance</code>, and</li>
+    <li><b>pitch overlap</b>: the projected corner range intersects the hit's <code>[pitch_min, pitch_max]</code> (± <code>projection_tolerance</code>).</li>
+  </ul>
+  <p>Each link <code>(hit_node, blob)</code> is recorded; the blob's semantic/instance labels are also pushed onto that
+  hit node here. → <code>graph[plane,"nexus","sp"].edge_index = to_sp.T</code>.</p>
+
+  <h3>5.3 (sp, nexus, sp) — blob message-passing graph</h3>
+  <p><code>ppedges</code> are <b>point↔point</b>; <code>_ppedges_to_blobedges</code> maps each endpoint to its
+  <code>blob_id</code> (<code>points[:,4]</code>), drops self-loops, and keeps unique undirected blob pairs. Edges
+  touching a <b>ghost</b> blob are pruned. → <code>graph["sp","nexus","sp"].edge_index</code>.</p>
+
+  <h3>5.4 (sp, supervision, sp) — truth "same-instance?" edges</h3>
+  <p>The truth <code>edge_index</code> (point indices) is mapped to blob pairs and labelled by <code>_label_blob_edges</code>:</p>
+  <pre><code>labelable = 1  ⇔  both endpoints have a valid truth instance id (tid ≥ 0) AND neither is ghost
+edge_y    = 1  ⇔  labelable AND both endpoints share the same tid</code></pre>
+  <p>Stored on the <code>sp</code> store as <code>edge_label_index</code>, <code>edge_y</code>, <code>edge_labelable</code>.
+  (If empty, a dummy unlabelable <code>0→0</code> self-edge is injected so HDF5 doesn't collapse the tensor.)
+  This is exactly the supervision signal <code>NuGraph4</code>'s edge / embedding losses consume.</p>
+
+  <!-- ================= 6 ================= -->
+  <h2>6 · Semantic &amp; instance labels</h2>
+  <pre><code>is_nu (per point)           blob aggregation                    encode
+──────────────────          ────────────────────────────       ────────────────
+ 1  (ν / signal)    ─┐      any ν point in blob → "nu"          "nu"    →  0
+ 0  (cosmic)         ├──►   else if known points → "cosmic"     "cosmic"→  1
+-2  (unmatched)     ─┘      all points -2        → ghost         ghost  → -1  (ignored by loss)</code></pre>
+  <ul>
+    <li><code>_label_blobs</code> computes the per-blob class <b>and</b> <code>frac_nu_hits</code> (ν purity).</li>
+    <li><code>_encode_semantic_labels</code> maps to the model's convention <code>{nu:0, cosmic:1, ghost:-1}</code>.</li>
+    <li><b>Ghost hygiene</b> is enforced twice: ghost <code>sp</code> get <code>vtx_*</code> wiped, <code>y_instance=-1</code>, and are pruned from both MP and supervision edges — so unmatched blobs never leak truth or carry loss.</li>
+  </ul>
+  <h3>Optional label refinements (off by default)</h3>
+  <ul>
+    <li><code>enable_vertex_semantic_fix</code>: flip false-negative blobs to ν if within 50 mm of the vertex and they actually contain ν hits.</li>
+    <li><code>enable_semantic_mp_propagation_fix</code>: BFS-spread ν labels from confident near-vertex seeds along the MP graph (<code>_semantic_propagate_on_mp</code>), bounded by hops / edge length / vtx distance; only ever flips <code>cosmic → nu</code>, never touches ghosts.</li>
+  </ul>
+
+  <!-- ================= 7 ================= -->
+  <h2>7 · From per-plane stores to the unified <span style="color:var(--hit)">hit</span> node</h2>
+  <p>The converter writes <b>separate <code>u</code>/<code>v</code>/<code>y</code> stores</b>. At load time the dataset
+  reshapes them into what the model expects:</p>
+  <ul>
+    <li><b><code>Transform</code></b> (<code>models/nugraph3/transform.py</code>): concatenates the three plane stores into a
+    single <b>hit</b> node type, offsets and merges their edges into <code>(hit, delaunay-planar, hit)</code> and
+    <code>(hit, nexus, sp)</code>, appends a <b>plane-id column</b>, copies <code>y_instance → pid</code>, builds
+    <code>(hit, in, evt)</code>, and finally prepends <code>pos</code> to <code>hit.x</code> and trims it to <code>in_features</code>.</li>
+    <li><b><code>NuGraphDataset.get</code></b> (<code>data/dataset.py</code>): promotes the <code>sp.edge_label_index</code>
+    (+<code>edge_y</code>, <code>edge_labelable</code>) into a real <b>(sp, supervision, sp)</b> edge store, and re-asserts
+    the ghost-masking invariant <code>y_instance[y_semantic==-1] = -1</code>.</li>
+  </ul>
+  <p>After these two steps the graph matches the node/edge types documented in
+  <a href="./nugraph4_architecture.html">nugraph4_architecture.html</a>.</p>
+
+  <!-- ================= 8 ================= -->
+  <h2>8 · End-to-end picture</h2>
+  <div class="mermaid">
+flowchart LR
+    subgraph WC["Wire-Cell NPZ"]
+        BL["blobs"]
+        PT["points<br/>(blob_id, cluster)"]
+        CT["ctpc_u/v/y<br/>measurements"]
+        PP["ppedges"]
+        EI["edge_index (truth)"]
+        IN["is_nu / vtx_*"]
+    end
+    subgraph CONV["pywcml converter"]
+        SP["sp nodes<br/>(blob centroids,<br/>charge, labels)"]
+        HIT["hit nodes<br/>(CTPC stripes per plane)"]
+        MP["(sp,nexus,sp)<br/>MP edges"]
+        SUP["(sp,supervision,sp)<br/>labelled edges"]
+        H2S["(hit,nexus,sp)<br/>projection match"]
+        HH["(hit,plane,hit)<br/>Delaunay"]
+    end
+    subgraph NG["NuGraphData / model input"]
+        UHIT["unified hit node<br/>(u+v+y merged)"]
+        USP["sp node"]
+        EVT["evt node"]
+    end
+    BL --> SP
+    PT --> SP
+    IN --> SP
+    CT --> HIT
+    BL -. project corners .-> H2S
+    CT --> H2S
+    HIT --> HH
+    PP --> MP
+    EI --> SUP
+    HIT --> UHIT
+    HH --> UHIT
+    H2S --> UHIT
+    SP --> USP
+    MP --> USP
+    SUP --> USP
+    SP --> EVT
+  </div>
+
+  <!-- ================= ref ================= -->
+  <h2>File reference</h2>
+  <div class="card">
+  <table>
+    <tr><th>Stage</th><th>Code</th></tr>
+    <tr><td>NPZ loading</td><td class="mono">pywcml/io.py :: load_npz</td></tr>
+    <tr><td>blob extraction</td><td class="mono">converter.py :: _extract_blobs</td></tr>
+    <tr><td>plane / hit building</td><td class="mono">converter.py :: _build_plane</td></tr>
+    <tr><td>corner projection, Delaunay</td><td class="mono">pywcml/geometry.py</td></tr>
+    <tr><td>semantic / instance labels</td><td class="mono">_label_blobs, _encode_semantic_labels, _truth_instance_by_blob</td></tr>
+    <tr><td>MP edges (ppedges→blob)</td><td class="mono">_get_blob_mp_edges, _ppedges_to_blobedges</td></tr>
+    <tr><td>supervision edges + labels</td><td class="mono">_get_blob_sup_edges_and_labels, _label_blob_edges</td></tr>
+    <tr><td>plane→hit merge</td><td class="mono">models/nugraph3/transform.py</td></tr>
+    <tr><td>supervision edge store</td><td class="mono">data/dataset.py :: NuGraphDataset.get</td></tr>
+    <tr><td>plane geometry / tolerances</td><td class="mono">pywcml/config.py :: ConversionConfig, default_planes</td></tr>
+  </table>
+  </div>
+
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    themeVariables: {
+      background: '#ffffff',
+      primaryColor: '#eaf3ff',
+      primaryBorderColor: '#1f6feb',
+      primaryTextColor: '#1c2530',
+      lineColor: '#5a6675',
+      fontFamily: 'SF Mono, ui-monospace, Menlo, Consolas, monospace',
+      fontSize: '13px'
+    }
+  });
+</script>
+</body>
+</html>
