@@ -63,7 +63,7 @@
     <span class="chip"><span class="dot" style="background:var(--sp)"></span>sp node (spacepoint / "nexus")</span>
     <span class="chip"><span class="dot" style="background:var(--evt)"></span>evt node (interaction)</span>
     <span class="chip"><span class="dot" style="background:var(--enc)"></span>Encoder</span>
-    <span class="chip"><span class="dot" style="background:var(--core)"></span>Core (×5 message passing)</span>
+    <span class="chip"><span class="dot" style="background:var(--core)"></span>Core (×10 message passing)</span>
   </div>
 
   <!-- ============================================================= -->
@@ -90,8 +90,13 @@
 
   <!-- ============================================================= -->
   <h2>2 · Forward pass — the shared trunk</h2>
-  <p><code>NuGraph3.forward</code> runs the encoder once, then the core <b><code>num_iters = 5</code></b> times, then every decoder head.
+  <p><code>NuGraph3.forward</code> runs the encoder once, then the core <b><code>num_iters = 10</code></b> times, then every decoder head.
   <code>NuGraph4.forward</code> calls <code>super().forward()</code> first, then computes the extra instance losses on the resulting embeddings.</p>
+  <p class="small">Dimensions and loss weights below follow the production launch config
+  <code>notebooks/nugraph_polaris_prod.pbs</code> in abhat's working dir:
+  <code>in_features=4</code>, <code>hit_features=256</code>, <code>nexus_features=64</code>, <code>interaction_features=32</code>, <code>num_iters=10</code>;
+  <code>use_sp_features=True</code>, <code>use_vtx_features=False</code> (only <code>sp.features</code> cols 0–1 consumed; vertex cols dropped);
+  <code>λ_embed=0.3</code>, <code>λ_edge=0.01</code>, <code>λ_coh=0</code>, <code>edge_pos_weight=0.15</code>.</p>
 
   <div class="card">
   <svg viewBox="0 0 1080 470" font-family="SF Mono, monospace" font-size="13">
@@ -104,28 +109,30 @@
 
     <!-- inputs -->
     <rect x="10" y="30" width="150" height="60" rx="9" fill="#eaf3ff" stroke="var(--hit)"/>
-    <text x="85" y="55" fill="var(--hit)" text-anchor="middle">hit.x  [N,4]</text>
-    <text x="85" y="74" fill="#5a6675" text-anchor="middle" font-size="11">raw hit feats</text>
+    <text x="85" y="49" fill="var(--hit)" text-anchor="middle" font-size="12">hit.x  [N,4]</text>
+    <text x="85" y="66" fill="#5a6675" text-anchor="middle" font-size="10">pos_x, pos_y,</text>
+    <text x="85" y="80" fill="#5a6675" text-anchor="middle" font-size="10">Q_tot, dQ_err</text>
 
     <rect x="10" y="120" width="150" height="60" rx="9" fill="#f3eeff" stroke="var(--sp)"/>
-    <text x="85" y="145" fill="var(--sp)" text-anchor="middle">sp.features</text>
-    <text x="85" y="164" fill="#5a6675" text-anchor="middle" font-size="11">charge, hit-count</text>
+    <text x="85" y="139" fill="var(--sp)" text-anchor="middle" font-size="12">sp.features [M,6]</text>
+    <text x="85" y="156" fill="#5a6675" text-anchor="middle" font-size="10">cols 0,1 used:</text>
+    <text x="85" y="170" fill="#5a6675" text-anchor="middle" font-size="10">charge, cluster_id</text>
 
     <!-- ENCODER -->
     <rect x="210" y="20" width="210" height="190" rx="12" fill="#e8f7f0" stroke="var(--enc)" stroke-width="1.5"/>
     <text x="315" y="42" fill="var(--enc)" text-anchor="middle" font-weight="bold">ENCODER (×1)</text>
     <rect x="228" y="56" width="174" height="34" rx="7" fill="#d4f0e3" stroke="#1a7f5a"/>
-    <text x="315" y="78" fill="#10543a" text-anchor="middle" font-size="12">InputNorm→Linear 4→128</text>
-    <text x="315" y="104" fill="var(--hit)" text-anchor="middle" font-size="11">hit.x → [N,128]</text>
+    <text x="315" y="78" fill="#10543a" text-anchor="middle" font-size="12">InputNorm→Linear 4→256</text>
+    <text x="315" y="104" fill="var(--hit)" text-anchor="middle" font-size="11">hit.x → [N,256]</text>
     <rect x="228" y="118" width="174" height="46" rx="7" fill="#d4f0e3" stroke="#1a7f5a"/>
     <text x="315" y="136" fill="#10543a" text-anchor="middle" font-size="11">scatter_mean(hit→sp)</text>
-    <text x="315" y="152" fill="#10543a" text-anchor="middle" font-size="11">Linear 128→32 + SP feats</text>
-    <text x="315" y="182" fill="var(--sp)" text-anchor="middle" font-size="11">sp.x → [M,32]</text>
+    <text x="315" y="152" fill="#10543a" text-anchor="middle" font-size="11">Linear 256→64 + SP feats</text>
+    <text x="315" y="182" fill="var(--sp)" text-anchor="middle" font-size="11">sp.x → [M,64]</text>
     <text x="315" y="200" fill="var(--evt)" text-anchor="middle" font-size="11">evt.x → zeros [E,32]</text>
 
     <!-- CORE -->
     <rect x="470" y="20" width="300" height="300" rx="12" fill="#fbf3d8" stroke="var(--core)" stroke-width="1.5"/>
-    <text x="620" y="42" fill="#8a6508" text-anchor="middle" font-weight="bold">CORE  ×5 iterations</text>
+    <text x="620" y="42" fill="#8a6508" text-anchor="middle" font-weight="bold">CORE  ×10 iterations</text>
     <text x="620" y="60" fill="#8a6508" text-anchor="middle" font-size="11">each = NuGraphBlock (attention + residual MLP)</text>
     <g font-size="11.5" fill="#5a4708">
       <rect x="486" y="74"  width="268" height="26" rx="6" fill="#f3e9c2"/><text x="620" y="91" text-anchor="middle">1. plane_net: hit → hit</text>
@@ -140,14 +147,14 @@
 
     <!-- OUTPUT EMBEDDINGS -->
     <rect x="820" y="60" width="240" height="80" rx="10" fill="#eaf3ff" stroke="var(--hit)"/>
-    <text x="940" y="86" fill="var(--hit)" text-anchor="middle">hit.x [N,128]</text>
+    <text x="940" y="86" fill="var(--hit)" text-anchor="middle">hit.x [N,256]</text>
     <text x="940" y="106" fill="#5a6675" text-anchor="middle" font-size="11">contextual hit embedding</text>
-    <text x="940" y="126" fill="#5a6675" text-anchor="middle" font-size="11">→ semantic / filter heads</text>
+    <text x="940" y="126" fill="#5a6675" text-anchor="middle" font-size="11">→ semantic head</text>
 
     <rect x="820" y="170" width="240" height="80" rx="10" fill="#f3eeff" stroke="var(--sp)"/>
-    <text x="940" y="196" fill="var(--sp)" text-anchor="middle">sp.x [M,32]</text>
+    <text x="940" y="196" fill="var(--sp)" text-anchor="middle">sp.x [M,64]</text>
     <text x="940" y="216" fill="#5a6675" text-anchor="middle" font-size="11">contextual SP embedding</text>
-    <text x="940" y="236" fill="#5a6675" text-anchor="middle" font-size="11">→ embed / edge / coh losses</text>
+    <text x="940" y="236" fill="#5a6675" text-anchor="middle" font-size="11">→ embed / edge losses</text>
 
     <!-- arrows -->
     <line x1="160" y1="60"  x2="208" y2="80"  stroke="#7a8694" marker-end="url(#arr)"/>
@@ -163,7 +170,7 @@
 
   <!-- ============================================================= -->
   <h2>3 · The four losses</h2>
-  <p>Total objective (with the production defaults <code>λ_embed=0.2</code>, <code>λ_edge=0</code>, <code>λ_coh=0</code>):</p>
+  <p>Total objective (production config <code>nugraph_polaris_prod.pbs</code>: <code>λ_embed=0.3</code>, <code>λ_edge=0.01</code>, <code>λ_coh=0</code>):</p>
   <div class="card" style="text-align:center;font-size:18px">
     <span class="mono">L<sub>total</sub> = L<sub>semantic</sub> + λ<sub>embed</sub>·L<sub>embed</sub> + λ<sub>edge</sub>·L<sub>edge</sub> + λ<sub>coh</sub>·L<sub>coh</sub></span>
   </div>
@@ -184,7 +191,7 @@
       <td><span class="mono">hit.x</span></td>
       <td>is-signal (<code>y_semantic≠-1</code>)</td>
       <td>BCE + learned temp</td>
-      <td><span class="tag pill-on">ON</span></td>
+      <td><span class="tag pill-off">OFF</span><br><span class="small">head not enabled</span></td>
     </tr>
     <tr>
       <td><span class="dot" style="background:var(--embed)"></span> <b>L<sub>embed</sub></b></td>
@@ -192,15 +199,15 @@
       <td><span class="mono">sp.x</span></td>
       <td><code>pid</code> (particle instance id)</td>
       <td>margin contrastive on pairwise distances</td>
-      <td><span class="tag pill-on">λ=0.2</span></td>
+      <td><span class="tag pill-on">λ=0.3</span></td>
     </tr>
     <tr>
       <td><span class="dot" style="background:var(--edge)"></span> <b>L<sub>edge</sub></b></td>
       <td><code>edge_mlp_sp</code> (NG4)</td>
       <td><span class="mono">sp.x</span> pairs + geometry</td>
       <td><code>edge_y</code> on supervision edges</td>
-      <td>BCE-with-logits (pos_weight)</td>
-      <td><span class="tag pill-off">λ=0</span></td>
+      <td>BCE-with-logits (pos_weight=0.15)</td>
+      <td><span class="tag pill-on">λ=0.01</span></td>
     </tr>
     <tr>
       <td><span class="dot" style="background:var(--coh)"></span> <b>L<sub>coh</sub></b></td>
@@ -208,9 +215,16 @@
       <td><span class="mono">hit.x_semantic</span> probs</td>
       <td>— (uses predicted clusters)</td>
       <td>intra-cluster variance of semantic probs</td>
-      <td><span class="tag pill-off">λ=0</span></td>
+      <td><span class="tag pill-off">λ=0 · OFF</span><br><span class="small">not computed</span></td>
     </tr>
   </table>
+
+  <div class="note"><b>Active in the production config (<code>nugraph_polaris_prod.pbs</code>):</b> only
+  <b style="color:var(--sem)">L<sub>semantic</sub></b>, <b style="color:var(--embed)">L<sub>embed</sub></b> (λ=0.3) and
+  <b style="color:var(--edge)">L<sub>edge</sub></b> (λ=0.01). <b>L<sub>filter</sub></b> is off because the
+  <code>--filter-head</code> flag isn't passed (so <code>FilterDecoder</code> is never built), and
+  <b>L<sub>coh</sub></b> is off because <code>λ_coh=0</code> (the coherence block is skipped entirely).
+  Effective objective: <span class="mono">L<sub>total</sub> = L<sub>semantic</sub> + 0.3·L<sub>embed</sub> + 0.01·L<sub>edge</sub></span>.</div>
 
   <h3>L<sub>embed</sub> in detail (the instance-aware core)</h3>
   <div class="card">
@@ -238,17 +252,17 @@ L_embed  = mean over events ( loss_pos + loss_neg )</pre>
     <text x="115" y="222" fill="#5a6675" text-anchor="middle" font-size="11">shared</text>
 
     <rect x="225" y="160" width="150" height="100" rx="12" fill="#fbf3d8" stroke="var(--core)" stroke-width="1.5"/>
-    <text x="300" y="200" fill="#8a6508" text-anchor="middle" font-weight="bold">CORE ×5</text>
+    <text x="300" y="200" fill="#8a6508" text-anchor="middle" font-weight="bold">CORE ×10</text>
     <text x="300" y="222" fill="#8a6508" text-anchor="middle" font-size="11">shared</text>
 
     <!-- embeddings -->
     <rect x="430" y="95" width="120" height="56" rx="9" fill="#eaf3ff" stroke="var(--hit)"/>
     <text x="490" y="120" fill="var(--hit)" text-anchor="middle">hit.x</text>
-    <text x="490" y="138" fill="#5a6675" text-anchor="middle" font-size="10">[N,128]</text>
+    <text x="490" y="138" fill="#5a6675" text-anchor="middle" font-size="10">[N,256]</text>
 
     <rect x="430" y="270" width="120" height="56" rx="9" fill="#f3eeff" stroke="var(--sp)"/>
     <text x="490" y="295" fill="var(--sp)" text-anchor="middle">sp.x</text>
-    <text x="490" y="313" fill="#5a6675" text-anchor="middle" font-size="10">[M,32]</text>
+    <text x="490" y="313" fill="#5a6675" text-anchor="middle" font-size="10">[M,64]</text>
 
     <!-- heads / losses -->
     <g>
@@ -258,24 +272,24 @@ L_embed  = mean over events ( loss_pos + loss_neg )</pre>
       <rect x="880" y="20" width="170" height="46" rx="9" fill="#f0f3f6" stroke="var(--sem)"/>
       <text x="965" y="46" fill="var(--sem)" text-anchor="middle">L_semantic</text>
 
-      <rect x="640" y="80" width="180" height="40" rx="9" fill="#e6eefb" stroke="var(--flt)"/>
-      <text x="730" y="105" fill="var(--flt)" text-anchor="middle">FilterDecoder Linear</text>
-      <rect x="880" y="80" width="170" height="40" rx="9" fill="#f0f3f6" stroke="var(--flt)"/>
-      <text x="965" y="105" fill="var(--flt)" text-anchor="middle">L_filter</text>
+      <rect x="640" y="80" width="180" height="40" rx="9" fill="#f0f1f3" stroke="#b3bcc7" stroke-dasharray="4 3"/>
+      <text x="730" y="105" fill="#9aa7b4" text-anchor="middle">FilterDecoder (off)</text>
+      <rect x="880" y="80" width="170" height="40" rx="9" fill="#f0f1f3" stroke="#b3bcc7" stroke-dasharray="4 3"/>
+      <text x="965" y="105" fill="#9aa7b4" text-anchor="middle">L_filter ✗</text>
 
       <rect x="880" y="250" width="170" height="44" rx="9" fill="#f0f3f6" stroke="var(--embed)"/>
       <text x="965" y="270" fill="var(--embed)" text-anchor="middle">L_embed</text>
-      <text x="965" y="286" fill="#5a6675" text-anchor="middle" font-size="10">×0.2 (no params)</text>
+      <text x="965" y="286" fill="#5a6675" text-anchor="middle" font-size="10">×0.3 (no params)</text>
 
       <rect x="640" y="310" width="180" height="40" rx="9" fill="#fbeed6" stroke="var(--edge)"/>
       <text x="730" y="335" fill="var(--edge)" text-anchor="middle">edge_mlp_sp</text>
       <rect x="880" y="310" width="170" height="40" rx="9" fill="#f0f3f6" stroke="var(--edge)"/>
-      <text x="965" y="335" fill="var(--edge)" text-anchor="middle">L_edge ×0</text>
+      <text x="965" y="335" fill="var(--edge)" text-anchor="middle">L_edge ×0.01</text>
 
-      <rect x="640" y="368" width="180" height="40" rx="9" fill="#efe7fc" stroke="var(--coh)"/>
-      <text x="730" y="393" fill="var(--coh)" text-anchor="middle">cluster variance</text>
-      <rect x="880" y="368" width="170" height="40" rx="9" fill="#f0f3f6" stroke="var(--coh)"/>
-      <text x="965" y="393" fill="var(--coh)" text-anchor="middle">L_coh ×0</text>
+      <rect x="640" y="368" width="180" height="40" rx="9" fill="#f0f1f3" stroke="#b3bcc7" stroke-dasharray="4 3"/>
+      <text x="730" y="393" fill="#9aa7b4" text-anchor="middle">cluster variance (off)</text>
+      <rect x="880" y="368" width="170" height="40" rx="9" fill="#f0f1f3" stroke="#b3bcc7" stroke-dasharray="4 3"/>
+      <text x="965" y="393" fill="#9aa7b4" text-anchor="middle">L_coh ✗ (λ=0)</text>
     </g>
 
     <!-- forward arrows (thin grey) -->
@@ -305,15 +319,15 @@ L_embed  = mean over events ( loss_pos + loss_neg )</pre>
   <h3>Path of each gradient</h3>
   <ul>
     <li><b style="color:var(--sem)">L<sub>semantic</sub></b> → SemanticDecoder MLP weights (+temp) → <code>hit.x</code> → Core → Encoder. Ghost hits (<code>y=-1</code>) are masked, contribute zero gradient.</li>
-    <li><b style="color:var(--flt)">L<sub>filter</sub></b> → Filter Linear (+temp) → <code>hit.x</code> → Core → Encoder.</li>
-    <li><b style="color:var(--embed)">L<sub>embed</sub></b> → <i>directly</i> into <code>sp.x</code> (no head params) → Core (nexus blocks) → Encoder. Scaled by the warm-up/ramp schedule × 0.2.</li>
-    <li><b style="color:var(--edge)">L<sub>edge</sub></b> → <code>edge_mlp_sp</code> weights <i>and</i> through the endpoint embeddings <code>sp.x</code> → Core → Encoder. (Inactive at λ=0, but logits still computed for eval.)</li>
-    <li><b style="color:var(--coh)">L<sub>coh</sub></b> → through <code>hit.x_semantic</code> (semantic probs) → SemanticDecoder → trunk. <b>Cluster construction is non-differentiable</b> (hard <code>p_same≥0.7</code> threshold + union-find): the cluster <i>membership mask</i> carries no gradient; only the variance-of-probs term inside each fixed cluster does.</li>
+    <li><b style="color:#9aa7b4">L<sub>filter</sub></b> → <i>(off in prod — <code>--filter-head</code> not set, so <code>FilterDecoder</code> is never built; no gradient path).</i> When enabled it would go Filter Linear (+temp) → <code>hit.x</code> → Core → Encoder.</li>
+    <li><b style="color:var(--embed)">L<sub>embed</sub></b> → <i>directly</i> into <code>sp.x</code> (no head params) → Core (nexus blocks) → Encoder. Scaled by the warm-up/ramp schedule × 0.3.</li>
+    <li><b style="color:var(--edge)">L<sub>edge</sub></b> → <code>edge_mlp_sp</code> weights <i>and</i> through the endpoint embeddings <code>sp.x</code> → Core → Encoder. <b>Active</b> at λ=0.01 (weak but non-zero, so the edge head <i>is</i> trained); logits also stashed for eval.</li>
+    <li><b style="color:#9aa7b4">L<sub>coh</sub></b> → <i>(off in prod — <code>λ_coh=0</code>, the coherence block is skipped and nothing is computed).</i> When enabled it flows through <code>hit.x_semantic</code> (semantic probs) → SemanticDecoder → trunk. Note <b>cluster construction is non-differentiable</b> (hard <code>p_same≥0.7</code> threshold + union-find): the cluster <i>membership mask</i> carries no gradient; only the variance-of-probs term inside each fixed cluster would.</li>
   </ul>
 
-  <div class="note warn"><b>Warm-up / ramp-up schedule.</b> <code>λ_embed</code>, <code>λ_edge</code>, <code>λ_coh</code> are <i>not</i> constant during training:
+  <div class="note warn"><b>Warm-up / ramp-up schedule.</b> <code>λ_embed</code> and <code>λ_edge</code> are <i>not</i> constant during training:
   epochs <span class="kbd">0–9</span> weight=0 (semantic-only), epochs <span class="kbd">10–19</span> linearly ramp 0→λ, epoch <span class="kbd">20+</span> full λ.
-  So early on, only the semantic/filter gradients shape the trunk; the contrastive signal is phased in once the embeddings are meaningful.</div>
+  So early on, only the semantic gradients shape the trunk; the contrastive / edge signals are phased in once the embeddings are meaningful.</div>
 
   <div class="note"><b>Implementation note.</b> <code>NuGraph4.__init__</code> also builds <code>embedding_decoder</code>, <code>semantic_head</code> and a hit-level <code>edge_mlp</code>, but the active <code>forward</code> path computes <code>L_embed</code>/<code>L_edge</code> directly on <code>sp.x</code> via <code>_instance_embedding_loss</code> and <code>edge_mlp_sp</code>. Those extra modules are defined but not on the live loss path in this beta.</div>
 
@@ -331,27 +345,27 @@ L_embed  = mean over events ( loss_pos + loss_neg )</pre>
 
     <rect x="210" y="110" width="180" height="80" rx="10" fill="#e8f7f0" stroke="var(--enc)"/>
     <text x="300" y="140" text-anchor="middle" fill="var(--enc)">Encoder +</text>
-    <text x="300" y="160" text-anchor="middle" fill="#8a6508">Core ×5</text>
+    <text x="300" y="160" text-anchor="middle" fill="#8a6508">Core ×10</text>
     <text x="300" y="178" text-anchor="middle" fill="#5a6675" font-size="10">eval mode, no_grad</text>
 
     <rect x="430" y="60" width="190" height="56" rx="9" fill="#e3f3e9" stroke="var(--sem)"/>
     <text x="525" y="83" text-anchor="middle" fill="var(--sem)">SemanticDecoder</text>
     <text x="525" y="101" text-anchor="middle" fill="#5a6675" font-size="10">softmax → hit.x_semantic</text>
 
-    <rect x="430" y="128" width="190" height="46" rx="9" fill="#e6eefb" stroke="var(--flt)"/>
-    <text x="525" y="156" text-anchor="middle" fill="var(--flt)">FilterDecoder → score</text>
+    <rect x="430" y="128" width="190" height="46" rx="9" fill="#f0f1f3" stroke="#b3bcc7" stroke-dasharray="4 3"/>
+    <text x="525" y="156" text-anchor="middle" fill="#9aa7b4">FilterDecoder (off) ✗</text>
 
     <rect x="430" y="186" width="190" height="56" rx="9" fill="#fbeed6" stroke="var(--edge)"/>
     <text x="525" y="208" text-anchor="middle" fill="var(--edge)">edge_mlp_sp → edge_logits</text>
-    <text x="525" y="226" text-anchor="middle" fill="#5a6675" font-size="10">only if λ_edge or λ_coh &gt; 0</text>
+    <text x="525" y="226" text-anchor="middle" fill="#5a6675" font-size="10">active (λ_edge=0.01 &gt; 0)</text>
 
     <!-- outputs -->
     <rect x="680" y="50" width="200" height="60" rx="9" fill="#f0f3f6" stroke="var(--sem)"/>
     <text x="780" y="74" text-anchor="middle" fill="var(--sem)">per-hit class</text>
     <text x="780" y="93" text-anchor="middle" fill="#5a6675" font-size="10">argmax(x_semantic)</text>
 
-    <rect x="680" y="128" width="200" height="46" rx="9" fill="#f0f3f6" stroke="var(--flt)"/>
-    <text x="780" y="156" text-anchor="middle" fill="var(--flt)">signal / noise mask</text>
+    <rect x="680" y="128" width="200" height="46" rx="9" fill="#f0f1f3" stroke="#b3bcc7" stroke-dasharray="4 3"/>
+    <text x="780" y="156" text-anchor="middle" fill="#9aa7b4">signal / noise mask (off)</text>
 
     <rect x="680" y="186" width="200" height="84" rx="9" fill="#f0f3f6" stroke="var(--edge)"/>
     <text x="780" y="208" text-anchor="middle" fill="var(--edge)">instance clusters</text>
@@ -361,10 +375,10 @@ L_embed  = mean over events ( loss_pos + loss_neg )</pre>
 
     <line x1="170" y1="150" x2="208" y2="150" stroke="var(--infer)" marker-end="url(#i)"/>
     <line x1="390" y1="140" x2="428" y2="90"  stroke="var(--infer)" marker-end="url(#i)"/>
-    <line x1="390" y1="150" x2="428" y2="150" stroke="var(--infer)" marker-end="url(#i)"/>
+    <line x1="390" y1="150" x2="428" y2="150" stroke="#c4ccd5" stroke-dasharray="4 3" marker-end="url(#i)"/>
     <line x1="390" y1="160" x2="428" y2="205" stroke="var(--infer)" marker-end="url(#i)"/>
     <line x1="620" y1="85"  x2="678" y2="80"  stroke="var(--infer)" marker-end="url(#i)"/>
-    <line x1="620" y1="150" x2="678" y2="150" stroke="var(--infer)" marker-end="url(#i)"/>
+    <line x1="620" y1="150" x2="678" y2="150" stroke="#c4ccd5" stroke-dasharray="4 3" marker-end="url(#i)"/>
     <line x1="620" y1="214" x2="678" y2="220" stroke="var(--infer)" marker-end="url(#i)"/>
   </svg>
   </div>
@@ -372,11 +386,11 @@ L_embed  = mean over events ( loss_pos + loss_neg )</pre>
   <h3>What you get out</h3>
   <ul>
     <li><b>Semantic class</b> per hit: <code>argmax(hit.x_semantic)</code> over the 5 classes (MIP/HIP/shower/michel/diffuse). This is the always-available primary output.</li>
-    <li><b>Filter score</b> per hit: signal-vs-noise probability from the filter head.</li>
+    <li><s><b>Filter score</b> per hit</s> — <b>not produced in prod</b>: the filter head isn't enabled, so there's no signal/noise output. (Background rejection instead falls out of the semantic classes.)</li>
     <li><b>Particle instances</b> (NuGraph4's purpose): the <code>edge_mlp_sp</code> scores every supervision SP–SP edge, <code>sigmoid</code> → <code>p_same</code>; edges with <code>p_same ≥ edge_thr</code> (default 0.7) are kept and run through <b>union-find</b> to form connected components = clustered spacepoints = reconstructed particles (<code>clusters_from_edges</code> in <code>eval_semantic.py</code>).</li>
   </ul>
 
-  <div class="note warn"><b>Checkpoint caveat for clustering.</b> Instance clustering at inference relies on <code>edge_logits</code>, which are only meaningful if the checkpoint was trained with <code>λ_edge &gt; 0</code>. With the default production config (<code>λ_edge=0</code>) the edge head is untrained — <code>eval_semantic.py</code> prints a warning and skips clustering. In that regime, the instance signal lives implicitly in the contrastive-shaped <code>sp.x</code> embeddings (from <code>L_embed</code>), which can instead be clustered directly by embedding distance.</div>
+  <div class="note warn"><b>Checkpoint note for clustering.</b> Instance clustering at inference relies on <code>edge_logits</code>, which are only meaningful if the checkpoint was trained with <code>λ_edge &gt; 0</code>. The production config (<code>nugraph_polaris_prod.pbs</code>) uses <code>λ_edge=0.01</code> &gt; 0, so the edge head <b>is</b> trained and <code>eval_semantic.py</code> can run the edge-based clustering. The weight is small, though, so the edge head is only weakly supervised — much of the instance signal still comes from the contrastive-shaped <code>sp.x</code> embeddings (<code>L_embed</code>, λ=0.3), which can also be clustered directly by embedding distance. (A checkpoint trained with <code>λ_edge=0</code> — e.g. <code>nugraph_ofi.pbs</code> — would leave the edge head untrained and skip clustering.)</div>
 
   <div class="note"><b>Training vs inference — the key difference.</b> The trunk and decoder heads are <i>identical</i>; only what happens to their outputs differs.
   <br>· <b>Training:</b> heads produce predictions → losses computed against truth → summed → <code>loss.backward()</code> updates trunk + heads.
