@@ -1,0 +1,453 @@
+<title>Running the NuGraph Semantic Evaluation on Sophia</title>
+<style>
+  :root {
+    --bg:#F6F7F9; --surface:#FFFFFF; --sunk:#EEF1F5;
+    --ink:#141922; --ink-2:#3D4655; --muted:#697384; --faint:#8A93A2;
+    --rule:#DCE1E8; --rule-strong:#C3CAD4;
+    --accent:#1B6E8C; --accent-soft:#E3F0F5; --accent-ink:#12525F;
+    --good:#2E7D58; --warn:#9A6516; --crit:#AC3B3B;
+    --code-bg:#151A22; --code-ink:#DCE3EC; --code-dim:#7F8A9B;
+    --sans:ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    --serif:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,ui-serif,serif;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg:#0F1319; --surface:#161B23; --sunk:#1B212B;
+      --ink:#E5E9EF; --ink-2:#BFC7D3; --muted:#96A0AF; --faint:#6E7887;
+      --rule:#262D38; --rule-strong:#38414F;
+      --accent:#5CB8D4; --accent-soft:#132A33; --accent-ink:#8FD3E6;
+      --good:#5EBE8C; --warn:#D2A05A; --crit:#E07B7B;
+      --code-bg:#0A0E13; --code-ink:#D3DBE5; --code-dim:#68727F;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg:#0F1319; --surface:#161B23; --sunk:#1B212B;
+    --ink:#E5E9EF; --ink-2:#BFC7D3; --muted:#96A0AF; --faint:#6E7887;
+    --rule:#262D38; --rule-strong:#38414F;
+    --accent:#5CB8D4; --accent-soft:#132A33; --accent-ink:#8FD3E6;
+    --good:#5EBE8C; --warn:#D2A05A; --crit:#E07B7B;
+    --code-bg:#0A0E13; --code-ink:#D3DBE5; --code-dim:#68727F;
+  }
+  :root[data-theme="light"] {
+    --bg:#F6F7F9; --surface:#FFFFFF; --sunk:#EEF1F5;
+    --ink:#141922; --ink-2:#3D4655; --muted:#697384; --faint:#8A93A2;
+    --rule:#DCE1E8; --rule-strong:#C3CAD4;
+    --accent:#1B6E8C; --accent-soft:#E3F0F5; --accent-ink:#12525F;
+    --good:#2E7D58; --warn:#9A6516; --crit:#AC3B3B;
+    --code-bg:#151A22; --code-ink:#DCE3EC; --code-dim:#7F8A9B;
+  }
+
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+         font-size:16px; line-height:1.62; -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:53rem; margin:0 auto; padding:0 1.5rem 6rem; }
+
+  /* ---- masthead ---- */
+  .masthead { padding:3.5rem 0 2rem; border-bottom:2px solid var(--ink); }
+  .kicker { font-family:var(--mono); font-size:.7rem; letter-spacing:.14em;
+            text-transform:uppercase; color:var(--accent); margin:0 0 1rem; }
+  h1 { font-size:clamp(1.9rem,4.4vw,2.9rem); line-height:1.12; letter-spacing:-.022em;
+       font-weight:640; margin:0; text-wrap:balance; }
+  .lede { font-family:var(--serif); font-size:1.14rem; line-height:1.6; color:var(--ink-2);
+          margin:1.4rem 0 0; max-width:44rem; }
+  .facts { display:grid; grid-template-columns:repeat(auto-fit,minmax(11rem,1fr));
+           gap:.9rem 1.75rem; margin:2rem 0 1.5rem; padding:0; list-style:none; }
+  .facts div { display:flex; flex-direction:column; gap:.2rem; }
+  .facts dt { font-family:var(--mono); font-size:.66rem; letter-spacing:.12em;
+              text-transform:uppercase; color:var(--faint); }
+  .facts dd { margin:0; font-family:var(--mono); font-size:.83rem; color:var(--ink-2);
+              word-break:break-word; }
+
+  /* ---- sections ---- */
+  section { padding-top:3.25rem; }
+  h2 { font-size:1.32rem; letter-spacing:-.012em; font-weight:640; margin:0 0 .35rem;
+       display:flex; align-items:baseline; gap:.7rem; text-wrap:balance; }
+  h2 .num { font-family:var(--mono); font-size:.78rem; color:var(--accent);
+            letter-spacing:.06em; flex:none; }
+  h3 { font-size:1rem; font-weight:650; letter-spacing:-.004em; margin:2rem 0 .5rem; }
+  .sub { color:var(--muted); margin:0 0 1.35rem; font-size:.95rem; max-width:44rem; }
+  p { margin:0 0 1rem; max-width:44rem; }
+  a { color:var(--accent); text-underline-offset:2px; }
+  a:focus-visible, summary:focus-visible { outline:2px solid var(--accent); outline-offset:3px; border-radius:2px; }
+  strong { font-weight:650; color:var(--ink); }
+  hr.rule { border:0; border-top:1px solid var(--rule); margin:2.75rem 0 0; }
+
+  /* ---- code ---- */
+  .code { background:var(--code-bg); color:var(--code-ink); border-radius:3px;
+          border-left:3px solid var(--accent); overflow-x:auto; margin:0 0 1.1rem; }
+  .code pre { margin:0; padding:1rem 1.15rem; font-family:var(--mono);
+              font-size:.815rem; line-height:1.72; }
+  .code .c { color:var(--code-dim); }
+  .code .p { color:#7FC9DE; }
+  .code-label { font-family:var(--mono); font-size:.68rem; letter-spacing:.1em;
+                text-transform:uppercase; color:var(--faint); margin:0 0 .4rem; }
+  code.inl { font-family:var(--mono); font-size:.86em; background:var(--sunk);
+             border:1px solid var(--rule); border-radius:2px; padding:.08em .34em;
+             color:var(--ink); word-break:break-word; }
+
+  /* ---- tables ---- */
+  .tbl-scroll { overflow-x:auto; margin:0 0 1.1rem; border:1px solid var(--rule); border-radius:3px; }
+  table { border-collapse:collapse; width:100%; font-size:.86rem;
+          font-variant-numeric:tabular-nums; background:var(--surface); }
+  th, td { text-align:left; padding:.56rem .8rem; border-bottom:1px solid var(--rule); white-space:nowrap; }
+  thead th { font-family:var(--mono); font-size:.67rem; letter-spacing:.1em;
+             text-transform:uppercase; color:var(--muted); background:var(--sunk);
+             border-bottom:1px solid var(--rule-strong); font-weight:500; }
+  tbody tr:last-child td { border-bottom:0; }
+  td.mono, th.mono { font-family:var(--mono); font-size:.8rem; }
+  td.num { text-align:right; font-family:var(--mono); font-size:.82rem; }
+
+  /* ---- callout ---- */
+  .note { border:1px solid var(--rule); border-left:3px solid var(--warn);
+          background:var(--surface); border-radius:3px; padding:.9rem 1.1rem; margin:0 0 1.2rem; }
+  .note.acc { border-left-color:var(--accent); }
+  .note p { margin:0; font-size:.92rem; color:var(--ink-2); max-width:none; }
+  .note p + p { margin-top:.6rem; }
+  .note .tag { font-family:var(--mono); font-size:.66rem; letter-spacing:.11em;
+               text-transform:uppercase; color:var(--warn); display:block; margin-bottom:.3rem; }
+  .note.acc .tag { color:var(--accent); }
+
+  /* ---- definition rows ---- */
+  .defs { display:grid; gap:1px; background:var(--rule); border:1px solid var(--rule);
+          border-radius:3px; margin:0 0 1.2rem; overflow:hidden; }
+  .defs > div { background:var(--surface); padding:.85rem 1.05rem; }
+  .defs .term { font-family:var(--mono); font-size:.82rem; color:var(--accent-ink);
+                margin:0 0 .25rem; }
+  .defs .body { margin:0; font-size:.92rem; color:var(--ink-2); max-width:none; }
+
+  /* ---- stat row ---- */
+  .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(8.5rem,1fr));
+           gap:1px; background:var(--rule); border:1px solid var(--rule);
+           border-radius:3px; overflow:hidden; margin:0 0 1.2rem; }
+  .stat { background:var(--surface); padding:.9rem 1rem; }
+  .stat .k { font-family:var(--mono); font-size:.65rem; letter-spacing:.11em;
+             text-transform:uppercase; color:var(--faint); margin:0 0 .3rem; }
+  .stat .v { font-family:var(--mono); font-size:1.28rem; color:var(--ink);
+             font-variant-numeric:tabular-nums; }
+  .stat .v.good { color:var(--good); }
+  .stat .v.warn { color:var(--warn); }
+
+  ul.tight { margin:0 0 1.1rem; padding-left:1.15rem; max-width:44rem; }
+  ul.tight li { margin-bottom:.42rem; }
+
+  details { border:1px solid var(--rule); border-radius:3px; background:var(--surface);
+            padding:.75rem 1rem; margin:0 0 .7rem; }
+  summary { cursor:pointer; font-weight:600; font-size:.93rem; }
+  details[open] summary { margin-bottom:.7rem; }
+
+  footer { margin-top:4rem; padding-top:1.5rem; border-top:1px solid var(--rule);
+           font-size:.85rem; color:var(--muted); }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="kicker">ALCF Sophia · Runbook</p>
+  <h1>Running the NuGraph Semantic Evaluation on Sophia</h1>
+  <p class="lede">How we measure NuGraph's neutrino-versus-cosmic classification on SBND data: what the
+  numbers mean, the exact commands that produce them, and where the results land. Everything here is
+  reproducible from a single batch submission.</p>
+  <dl class="facts">
+    <div><dt>Machine</dt><dd>Sophia (ALCF)</dd></div>
+    <div><dt>Project</dt><dd>neutrinogpu::wirecell</dd></div>
+    <div><dt>Queue</dt><dd>single-gpu</dd></div>
+    <div><dt>Working dir</dt><dd>/lus/eagle/projects/<wbr>neutrinoGPU/snehadri/sbnd</dd></div>
+  </dl>
+</header>
+
+<section>
+  <h2><span class="num">01</span> What is being measured</h2>
+  <p class="sub">Two numbers per event, both about the neutrino class.</p>
+
+  <div class="defs">
+    <div>
+      <p class="term">neutrino efficiency = correct-nu / true-nu</p>
+      <p class="body">Of everything that <em>is</em> neutrino, the fraction NuGraph tagged as neutrino. This is recall — it answers “did we find the neutrino?”</p>
+    </div>
+    <div>
+      <p class="term">neutrino purity = correct-nu / predicted-nu</p>
+      <p class="body">Of everything NuGraph <em>called</em> neutrino, the fraction that really is. This is precision — it answers “is what we found actually neutrino?”</p>
+    </div>
+  </div>
+
+  <h3>The unit is a blob, not a hit</h3>
+  <p>NuGraph's semantic head predicts per <strong>plane-hit</strong>, emitting a two-class softmax
+  <code class="inl">[p(nu), p(cosmic)]</code>. A <strong>blob</strong> (3D spacepoint) has no prediction of
+  its own — it inherits one by averaging its hits' <code class="inl">p(nu)</code> along the nexus edges that
+  connect hits to blobs:</p>
+
+  <div class="code"><pre>p(nu)_blob = mean( p(nu)_hit  for every hit wired to that blob )
+predicted nu  &lt;=&gt;  p(nu)_blob &gt;= 0.5</pre></div>
+
+  <p>The threshold is on <strong>p(nu)</strong>. Because it is a two-class problem, 0.5 simply means
+  “neutrino is the more likely class.” Sweeping this threshold is exactly what generates the
+  purity–efficiency curve.</p>
+
+  <div class="note acc">
+    <span class="tag">Why blobs</span>
+    <p>Blob-space is both the more faithful measure and what the Bee event display shows. Blobs carry a
+    real truth label; scoring individual hits requires propagating blob truth back down the nexus edge
+    (first-edge-wins), which is noisy. Averaging several hits also smooths per-hit fluctuation.</p>
+  </div>
+
+  <p>Reported metrics are <strong>unweighted blob counts</strong> — not charge-weighted. A charge-weighted
+  variant exists separately.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <h2><span class="num">02</span> Environment</h2>
+  <p class="sub">No modules to load — a prebuilt conda environment is invoked by absolute path.</p>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>Component</th><th>Path</th></tr></thead>
+      <tbody>
+        <tr><td>Python + NuGraph</td><td class="mono">/lus/eagle/projects/neutrinoGPU/abhat/conda/envs/nugraph-a/bin/python</td></tr>
+        <tr><td>Scripts</td><td class="mono">/lus/eagle/projects/neutrinoGPU/snehadri/sbnd/</td></tr>
+        <tr><td>NuGraph repo</td><td class="mono">/lus/eagle/projects/neutrinoGPU/snehadri/nugraph/</td></tr>
+        <tr><td>Source dataset</td><td class="mono">/lus/eagle/projects/neutrinoGPU/abhat/sbnd/clustering/converted_labeled_samples_merged_350k.h5</td></tr>
+        <tr><td>Checkpoint</td><td class="mono">…/clustering/nugraph/notebooks/log/N4_…_merged_350k_sophia/checkpoints/best-f1.ckpt</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The checkpoint is the <code class="inl">best-f1</code> epoch, selected on
+  <code class="inl">semantic/f1-macro-val</code>. In this training run
+  <code class="inl">best-f1</code>, <code class="inl">best-instance-f1</code> and
+  <code class="inl">best-joint-f1</code> are byte-identical.</p>
+
+  <div class="note">
+    <span class="tag">Compute note</span>
+    <p>These evaluation scripts load the checkpoint with <code class="inl">map_location="cpu"</code> and run
+    on <strong>CPU</strong>. The GPU is not required — the <code class="inl">single-gpu</code> queue is used
+    for consistency with the rest of the pipeline and because it schedules quickly. Runtime is dominated by
+    model construction (~90 s); the 20-graph forward pass itself is seconds.</p>
+    <p>Run this through the scheduler, <strong>not on a Sophia login node</strong>.</p>
+  </div>
+</section>
+
+<hr class="rule">
+
+<section>
+  <h2><span class="num">03</span> Quick start</h2>
+  <p class="sub">One submission reproduces both the metrics table and the event display.</p>
+
+  <p class="code-label">Submit</p>
+  <div class="code"><pre><span class="c"># from anywhere on Sophia</span>
+qsub /lus/eagle/projects/neutrinoGPU/snehadri/sbnd/nugraph_perevent_eval.pbs
+
+<span class="c"># watch it</span>
+qstat -u $USER
+tail -f /lus/eagle/projects/neutrinoGPU/snehadri/sbnd/nugraph_perevent_eval.pbs.log</pre></div>
+
+  <p class="code-label">nugraph_perevent_eval.pbs — job header</p>
+  <div class="code"><pre><span class="p">#PBS -N</span> ng_perevent
+<span class="p">#PBS -A</span> neutrinogpu::wirecell
+<span class="p">#PBS -q</span> single-gpu
+<span class="p">#PBS -l</span> select=1:ncpus=16:ngpus=1
+<span class="p">#PBS -l</span> filesystems=eagle:home
+<span class="p">#PBS -l</span> walltime=01:00:00
+<span class="p">#PBS -j</span> oe</pre></div>
+
+  <p>Total wall time is a few minutes; the one-hour request is headroom. The job runs the three stages in
+  <a href="#stages">§04</a> in order and is idempotent — stage 1 is skipped if the event file already exists.</p>
+
+  <h3>Interactive alternative</h3>
+  <p>To iterate on a single stage, take an interactive node rather than running on the login node:</p>
+  <div class="code"><pre>qsub -I -A neutrinogpu::wirecell -q single-gpu \
+     -l select=1:ncpus=16:ngpus=1 -l filesystems=eagle:home \
+     -l walltime=01:00:00
+
+<span class="c"># then, on the compute node</span>
+SB=/lus/eagle/projects/neutrinoGPU/snehadri/sbnd
+PY=/lus/eagle/projects/neutrinoGPU/abhat/conda/envs/nugraph-a/bin/python
+export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+cd $SB</pre></div>
+</section>
+
+<hr class="rule">
+
+<section id="stages">
+  <h2><span class="num">04</span> The three stages</h2>
+  <p class="sub">Select events → score them → render them. Each stage is a standalone script taking absolute
+  paths, so it can be re-run on its own.</p>
+
+  <h3>Stage 1 — Select 10 complete, balanced events</h3>
+  <p class="code-label">select_events.py → data/abhat_events.h5</p>
+  <div class="code"><pre>$PY $SB/select_events.py</pre></div>
+
+  <p>The source H5 stores <strong>one graph per APA</strong> (drift volume). SBND has two, so one physics
+  event is two graphs. A neutrino occupies only one drift volume, which is why a lone APA graph can contain
+  no neutrino at all. The selection therefore works at event level:</p>
+
+  <ul class="tight">
+    <li>Parse every <strong>test-split</strong> graph name into <code class="inl">(file, entry, apa)</code> and keep only events whose <strong>both</strong> APAs are in the test split — 14,295 of 52,893 graphs qualify. (The split is per-graph, so an event's halves often straddle train and test.)</li>
+    <li>Sample 220 of those events evenly across the list.</li>
+    <li>Score neutrino content from blob truth (<code class="inl">sp/y_semantic</code>, class 0 = nu), pooling both APAs.</li>
+    <li>Require a genuine mix: &gt;200 blobs total, and at least 60 neutrino <em>and</em> 60 cosmic blobs.</li>
+    <li>Rank by <code class="inl">|nu_frac − 0.5|</code> and keep the 10 closest to balanced.</li>
+  </ul>
+
+  <p>Output is written with each event's <strong>apa0 immediately followed by its apa1</strong>. Downstream
+  scripts rely on this ordering to pool every two consecutive graphs into one event.</p>
+
+  <h3>Stage 2 — Per-event semantic metrics</h3>
+  <p class="code-label">perevent_semantic_blob.py → results/perevent_semantic_blob.csv</p>
+  <div class="code"><pre>$PY $SB/perevent_semantic_blob.py \
+    $SB/data/abhat_events.h5 \
+    "$CKPT" \
+    $SB/results/perevent_semantic_blob.csv \
+    0.5          <span class="c"># threshold on p(nu)</span></pre></div>
+
+  <p>For each labelled blob it averages hit <code class="inl">p(nu)</code> through the nexus edge, thresholds
+  at 0.5, pools both APAs, and emits one row per event. CSV columns:</p>
+
+  <div class="code"><pre>event,n_blobs,n_nu,nu_frac,efficiency,purity</pre></div>
+
+  <p>Events are <strong>zero-indexed</strong> (0–9), matching the Bee display.</p>
+
+  <h3>Stage 3 — Bee event display</h3>
+  <p class="code-label">bee_nugraph_events.py → results/bee_events10/bee-nugraph.zip</p>
+  <div class="code"><pre>$PY $SB/bee_nugraph_events.py \
+    $SB/data/abhat_events.h5 \
+    "$CKPT" \
+    $SB/results/bee_events10 \
+    0.5</pre></div>
+
+  <p>Writes one Bee folder per physics event (both APAs merged, so 10 folders, not 20). Each event carries
+  four point-sets, all viewed through <strong>“Show Cluster”</strong> so no color-scale adjustment is needed:</p>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead><tr><th>Set</th><th>cluster_id encodes</th></tr></thead>
+      <tbody>
+        <tr><td class="mono">truth-semantic</td><td>0 = cosmic, 1 = nu (truth)</td></tr>
+        <tr><td class="mono">nugraph-semantic</td><td>0 = cosmic, 1 = nu (predicted)</td></tr>
+        <tr><td class="mono">truth-instance</td><td>true instance id</td></tr>
+        <tr><td class="mono">nugraph-instance</td><td>predicted instance id (edge head + union-find)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="note">
+    <span class="tag">Expected asymmetry</span>
+    <p>The <code class="inl">nugraph-*</code> sets contain <strong>more points</strong> than the
+    <code class="inl">truth-*</code> sets. Truth sets draw only blobs carrying a label
+    (<code class="inl">y_semantic ≥ 0</code>); NuGraph scores every reconstructed spacepoint, including
+    Wire-Cell ghost blobs that truth-matching could not tie to any energy deposit. This is expected, not a bug.</p>
+  </div>
+
+  <p>Download the zip and upload it to Bee:</p>
+  <div class="code"><pre>scp sophia.alcf.anl.gov:/lus/eagle/projects/neutrinoGPU/snehadri/sbnd/results/bee_events10/bee-nugraph.zip .</pre></div>
+</section>
+
+<hr class="rule">
+
+<section>
+  <h2><span class="num">05</span> Results</h2>
+  <p class="sub">10 balanced events, per-blob, threshold p(nu) ≥ 0.5.</p>
+
+  <div class="stats">
+    <div class="stat"><p class="k">Mean efficiency</p><div class="v good">0.938</div></div>
+    <div class="stat"><p class="k">Mean purity</p><div class="v good">0.912</div></div>
+    <div class="stat"><p class="k">Median efficiency</p><div class="v good">1.000</div></div>
+    <div class="stat"><p class="k">Median purity</p><div class="v good">0.929</div></div>
+  </div>
+
+  <div class="tbl-scroll">
+    <table>
+      <thead>
+        <tr><th class="mono">event</th><th class="mono">blobs</th><th class="mono">nu_frac</th>
+            <th class="mono">efficiency</th><th class="mono">purity</th></tr>
+      </thead>
+      <tbody>
+        <tr><td class="num">0</td><td class="num">4518</td><td class="num">49.3%</td><td class="num">1.000</td><td class="num">0.927</td></tr>
+        <tr><td class="num">1</td><td class="num">1512</td><td class="num">54.0%</td><td class="num">0.930</td><td class="num">0.921</td></tr>
+        <tr><td class="num">2</td><td class="num">7515</td><td class="num">41.6%</td><td class="num">0.451</td><td class="num">0.969</td></tr>
+        <tr><td class="num">3</td><td class="num">5627</td><td class="num">38.0%</td><td class="num">1.000</td><td class="num">0.930</td></tr>
+        <tr><td class="num">4</td><td class="num">4498</td><td class="num">33.0%</td><td class="num">0.999</td><td class="num">0.999</td></tr>
+        <tr><td class="num">5</td><td class="num">3787</td><td class="num">32.7%</td><td class="num">1.000</td><td class="num">0.866</td></tr>
+        <tr><td class="num">6</td><td class="num">851</td><td class="num">67.9%</td><td class="num">1.000</td><td class="num">0.948</td></tr>
+        <tr><td class="num">7</td><td class="num">1202</td><td class="num">32.4%</td><td class="num">1.000</td><td class="num">0.700</td></tr>
+        <tr><td class="num">8</td><td class="num">1998</td><td class="num">30.7%</td><td class="num">1.000</td><td class="num">0.952</td></tr>
+        <tr><td class="num">9</td><td class="num">7237</td><td class="num">29.6%</td><td class="num">1.000</td><td class="num">0.911</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Most events reach essentially perfect efficiency. Purity is the softer number — some cosmic blobs leak
+  into the neutrino prediction.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <h2><span class="num">06</span> How to read these numbers</h2>
+
+  <div class="note">
+    <span class="tag">Not a representative sample</span>
+    <p>These ten events were deliberately selected for <strong>class balance</strong> (30–68% neutrino blobs).
+    Typical events in this dataset are far more cosmic-dominated — roughly <strong>8% neutrino</strong> pooled.
+    Purity in particular is easier at high neutrino fraction, because a no-skill classifier's purity equals the
+    neutrino prior. These numbers characterize behavior on neutrino-rich events, <em>not</em> average
+    detector conditions.</p>
+  </div>
+
+  <ul class="tight">
+    <li><strong>Threshold is a free parameter.</strong> 0.5 is the default, not an optimum. The purity–efficiency curve (<code class="inl">pr_curve.py</code>) traces the full trade-off.</li>
+    <li><strong>Unweighted.</strong> Blob counts, not charge-weighted; large and small blobs count equally.</li>
+    <li><strong>Held-out data.</strong> Events come only from the test split of the training dataset.</li>
+    <li><strong>Instance clustering is truth-gated.</strong> The predicted-instance set derives from the edge head and requires labelable edges, so it degrades to one-cluster-per-blob on unlabeled real data. Semantic results are unaffected.</li>
+  </ul>
+</section>
+
+<hr class="rule">
+
+<section>
+  <h2><span class="num">07</span> File inventory</h2>
+
+  <details>
+    <summary>Scripts</summary>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>File</th><th>Role</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">nugraph_perevent_eval.pbs</td><td>Batch driver — runs all three stages</td></tr>
+          <tr><td class="mono">select_events.py</td><td>Stage 1 — pick 10 balanced complete events</td></tr>
+          <tr><td class="mono">perevent_semantic_blob.py</td><td>Stage 2 — per-event metrics, per blob</td></tr>
+          <tr><td class="mono">bee_nugraph_events.py</td><td>Stage 3 — Bee zip, one folder per event</td></tr>
+          <tr><td class="mono">perevent_semantic.py</td><td>Per-event metrics scored per hit (comparison)</td></tr>
+          <tr><td class="mono">pr_curve.py</td><td>Purity–efficiency and ROC curves</td></tr>
+          <tr><td class="mono">nugraph_metrics.py</td><td>Aggregate metrics over a whole file</td></tr>
+          <tr><td class="mono">diag_lowperf.py</td><td>Score distribution / error-structure diagnostics</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+
+  <details>
+    <summary>Data and outputs</summary>
+    <div class="tbl-scroll">
+      <table>
+        <thead><tr><th>File</th><th>Contents</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">data/abhat_events.h5</td><td>10 balanced events, 20 graphs, APA-paired</td></tr>
+          <tr><td class="mono">data/wct_all_truth.h5</td><td>Our Wire-Cell sample — 382 events / 764 graphs</td></tr>
+          <tr><td class="mono">results/perevent_semantic_blob.csv</td><td>Per-event metrics, per blob (reported)</td></tr>
+          <tr><td class="mono">results/perevent_semantic.csv</td><td>Per-event metrics, per hit</td></tr>
+          <tr><td class="mono">results/pr_curve.csv</td><td>Full purity–efficiency curve</td></tr>
+          <tr><td class="mono">results/bee_events10/bee-nugraph.zip</td><td>Bee display, 10 events × 4 sets</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
+</section>
+
+<footer>
+  Paths are relative to <code class="inl">/lus/eagle/projects/neutrinoGPU/snehadri/sbnd</code> unless
+  absolute. Checkpoint: <code class="inl">best-f1.ckpt</code>, epoch 94.
+</footer>
+
+</div>
