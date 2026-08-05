@@ -812,5 +812,22 @@ class NuGraph4(NuGraph3):
                             metrics["edge/f1"] = edge_f1
                             metrics["edge/precision"] = precision
                             metrics["edge/recall"] = recall
+                            metrics[f"instance/f1-{stage}"] = edge_f1
+                            metrics[f"instance/precision-{stage}"] = precision
+                            metrics[f"instance/recall-{stage}"] = recall
+
+        # Combined model-selection metric for joint semantic + instance training.
+        # This uses validation/test semantic macro-F1 and edge same-instance F1.
+        # Full connected-component ARI is intentionally kept out of the training
+        # loop because it is too expensive to compute every validation epoch.
+        if stage in ("val", "test"):
+            semantic_f1 = metrics.get(f"semantic/f1-macro-{stage}")
+            instance_f1 = metrics.get(f"instance/f1-{stage}")
+            if semantic_f1 is not None and instance_f1 is not None:
+                semantic_f1 = torch.as_tensor(semantic_f1, device=x.device).float()
+                instance_f1 = torch.as_tensor(instance_f1, device=x.device).float()
+                metrics[f"combined/semantic_instance_f1-{stage}"] = (
+                    2.0 * semantic_f1 * instance_f1 / (semantic_f1 + instance_f1 + 1e-8)
+                )
 
         return total_loss, metrics

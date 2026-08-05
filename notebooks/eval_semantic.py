@@ -67,6 +67,32 @@ def parse_args():
             "(β<1 favors precision; β>1 favors recall). If omitted, uses best-F1."
         ),
     )
+    p.add_argument(
+        "--event-min-pred-nu-hits",
+        type=int,
+        default=1,
+        help=(
+            "Event-level predicted-nu cut: require at least this many hits with "
+            "p(nu) >= threshold. Default 1 reproduces the old any-hit rule."
+        ),
+    )
+    p.add_argument(
+        "--event-min-pred-nu-frac",
+        type=float,
+        default=0.0,
+        help=(
+            "Event-level predicted-nu cut: require at least this fraction of labeled "
+            "hits with p(nu) >= threshold. Combined with --event-min-pred-nu-hits."
+        ),
+    )
+    p.add_argument(
+        "--skip-semantics",
+        action="store_true",
+        help=(
+            "Skip semantic hit/event reports and PR curve generation. Useful when "
+            "only edge/instance metrics are needed."
+        ),
+    )
 
     # NEW: neutrino-hit cut controls (must match your DataModule)
     p.add_argument(
@@ -150,6 +176,20 @@ def parse_args():
 
 def normalize_split(split):
     return "val" if split == "validation" else split
+
+
+def capped_tqdm(iterable, limit=None, **kwargs):
+    """tqdm wrapper that displays the effective capped length when --limit is set."""
+    from tqdm import tqdm
+
+    total = None
+    if limit is not None:
+        try:
+            total = min(int(limit), len(iterable))
+        except TypeError:
+            total = int(limit)
+
+    return tqdm(iterable, total=total, **kwargs)
 
 
 def make_datamodule(
@@ -236,14 +276,12 @@ def collect_split(nugraph, loader, device, limit=None, expected_width=None):
       y_score:   p(nu) probabilities
       evt_id:    global event id per hit (unique across split)
     """
-    from tqdm import tqdm
-
     nugraph.eval().to(device)
     y_true, y_pred, y_score, evt_id = [], [], [], []
     evt_offset = 0
 
     print("Collecting predictions from the model (semantic)...")
-    for i, b in enumerate(tqdm(loader)):
+    for i, b in enumerate(capped_tqdm(loader, limit=limit)):
         if limit is not None and i >= limit:
             break
         b = b.to(device)
@@ -400,8 +438,6 @@ def collect_edge_split(nugraph, loader, device, limit=None, max_edges=None):
       y_edge_true:  np array of {0,1} (0=different instance, 1=same instance)
       y_edge_score: np array of predicted prob(edge connects same instance)
     """
-    from tqdm import tqdm
-
     nugraph.eval().to(device)
     y_true_all = []
     y_score_all = []
@@ -410,7 +446,7 @@ def collect_edge_split(nugraph, loader, device, limit=None, max_edges=None):
     first_batch = True  # For debug output
 
     print("Collecting predictions from the model (edges)...")
-    for i, b in enumerate(tqdm(loader)):
+    for i, b in enumerate(capped_tqdm(loader, limit=limit)):
         if limit is not None and i >= limit:
             break
 
@@ -606,8 +642,6 @@ def collect_instance_cluster_metrics(
     min_cluster_size=2,
     limit=None,
 ):
-    from tqdm import tqdm
-
     nugraph.eval().to(device)
 
     total_points = 0
@@ -617,7 +651,7 @@ def collect_instance_cluster_metrics(
     graphs_used = 0
 
     print("Collecting predictions from the model (SP instance clusters)...")
-    for i, b in enumerate(tqdm(loader)):
+    for i, b in enumerate(capped_tqdm(loader, limit=limit)):
         if limit is not None and i >= limit:
             break
 
@@ -829,10 +863,18 @@ def plot_pr_curve(y_true, y_score, filename, beta=None):
     print(f"--> Saved plot to {filename}")
 
 
-def report_event_level(y_true, y_score, evt_id, nu_thr, split_name):
+def report_event_level(
+    y_true,
+    y_score,
+    evt_id,
+    nu_thr,
+    split_name,
+    event_min_pred_nu_hits=1,
+    event_min_pred_nu_frac=0.0,
+):
     """
     Event is positive if it contains ANY true nu hits (y_true==0).
-    Event is predicted positive if it contains ANY predicted nu hits above threshold.
+    Event is predicted positive if enough hits pass the p(nu) threshold.
     """
     order = np.argsort(evt_id)
     evt_id_s = evt_id[order]
@@ -851,7 +893,12 @@ def report_event_level(y_true, y_score, evt_id, nu_thr, split_name):
         s_e = s_s[lo:hi]
 
         true_event_nu = np.any(y_e == 0)
-        pred_event_nu = np.any(s_e >= nu_thr)
+        pred_nu_hits = int((s_e >= nu_thr).sum())
+        pred_nu_frac = pred_nu_hits / max(1, len(s_e))
+        pred_event_nu = (
+            pred_nu_hits >= event_min_pred_nu_hits
+            and pred_nu_frac >= event_min_pred_nu_frac
+        )
 
         y_evt_true.append(1 if true_event_nu else 0)
         y_evt_pred.append(1 if pred_event_nu else 0)
@@ -860,6 +907,11 @@ def report_event_level(y_true, y_score, evt_id, nu_thr, split_name):
     y_evt_pred = np.array(y_evt_pred, dtype=int)
 
     print(f"\n[{split_name}] EVENT-LEVEL @thr={nu_thr:.3f}")
+    print(
+        "Predicted nu-event cut: "
+        f"pred_nu_hits >= {event_min_pred_nu_hits} and "
+        f"pred_nu_frac >= {event_min_pred_nu_frac:.4f}"
+    )
     print(f"Events: {len(y_evt_true)} | true nu-events: {int(y_evt_true.sum())}")
 
     cm = confusion_matrix(y_evt_true, y_evt_pred, labels=[0, 1])
@@ -942,42 +994,53 @@ def main():
     # =========================================================================
     # SEMANTIC EVALUATION
     # =========================================================================
-    y_true, y_pred, y_score, evt_id = collect_split(
-        nugraph,
-        loader,
-        args.device,
-        args.limit,
-        expected_width=expected_in_features,
-    )
-
-    report_argmax(y_true, y_pred, y_score, split_name)
-
-    # Choose threshold
-    if args.nu_thr is not None:
-        chosen_thr = float(args.nu_thr)
-        header = f"[{split_name}] THRESHOLDED (user)"
+    if args.skip_semantics:
+        print("\n[Info] Skipping semantic evaluation (--skip-semantics).")
     else:
-        if args.beta is not None:
-            chosen_thr, p, r = pick_best_fbeta_threshold(y_true, y_score, beta=args.beta)
-            print(
-                f"\nBest-F{args.beta:.2f} ν-threshold found: {chosen_thr:.3f} "
-                f"(precision={p:.3f}, recall={r:.3f})"
-            )
-            header = f"[{split_name}] THRESHOLDED (best-F{args.beta:.2f})"
+        y_true, y_pred, y_score, evt_id = collect_split(
+            nugraph,
+            loader,
+            args.device,
+            args.limit,
+            expected_width=expected_in_features,
+        )
+
+        report_argmax(y_true, y_pred, y_score, split_name)
+
+        # Choose threshold
+        if args.nu_thr is not None:
+            chosen_thr = float(args.nu_thr)
+            header = f"[{split_name}] THRESHOLDED (user)"
         else:
-            chosen_thr, p, r = pick_best_f1_threshold(y_true, y_score)
-            print(
-                f"\nBest-F1 ν-threshold found: {chosen_thr:.3f} "
-                f"(precision={p:.3f}, recall={r:.3f})"
-            )
-            header = f"[{split_name}] THRESHOLDED (best-F1)"
+            if args.beta is not None:
+                chosen_thr, p, r = pick_best_fbeta_threshold(y_true, y_score, beta=args.beta)
+                print(
+                    f"\nBest-F{args.beta:.2f} ν-threshold found: {chosen_thr:.3f} "
+                    f"(precision={p:.3f}, recall={r:.3f})"
+                )
+                header = f"[{split_name}] THRESHOLDED (best-F{args.beta:.2f})"
+            else:
+                chosen_thr, p, r = pick_best_f1_threshold(y_true, y_score)
+                print(
+                    f"\nBest-F1 ν-threshold found: {chosen_thr:.3f} "
+                    f"(precision={p:.3f}, recall={r:.3f})"
+                )
+                header = f"[{split_name}] THRESHOLDED (best-F1)"
 
-    # Report BOTH hit-level thresholded and event-level at the chosen threshold
-    report_thresholded(y_true, y_score, chosen_thr, header=header)
-    report_event_level(y_true, y_score, evt_id, chosen_thr, split_name)
+        # Report BOTH hit-level thresholded and event-level at the chosen threshold
+        report_thresholded(y_true, y_score, chosen_thr, header=header)
+        report_event_level(
+            y_true,
+            y_score,
+            evt_id,
+            chosen_thr,
+            split_name,
+            event_min_pred_nu_hits=args.event_min_pred_nu_hits,
+            event_min_pred_nu_frac=args.event_min_pred_nu_frac,
+        )
 
-    plot_filename = f"{split}_{os.path.basename(args.ckpt).replace('.ckpt', '_pr_curve.png')}"
-    plot_pr_curve(y_true, y_score, plot_filename, beta=args.beta)
+        plot_filename = f"{split}_{os.path.basename(args.ckpt).replace('.ckpt', '_pr_curve.png')}"
+        plot_pr_curve(y_true, y_score, plot_filename, beta=args.beta)
 
     # =========================================================================
     # EDGE EVALUATION (OPTIONAL)

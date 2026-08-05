@@ -19,6 +19,24 @@ warnings.filterwarnings('ignore', '.*TypedStorage is deprecated.*')
 Data = ng.data.H5DataModule
 Model = ng.models.NuGraph3
 
+
+def configure_wandb_paths():
+    """Keep all W&B writes off $HOME by default."""
+    wandb_base = pathlib.Path(os.environ.get(
+        "WANDB_BASE",
+        "/lus/eagle/projects/neutrinoGPU/abhat/wandb",
+    ))
+    os.environ.setdefault("WANDB_DIR", str(wandb_base / "run"))
+    os.environ.setdefault("WANDB_CACHE_DIR", str(wandb_base / "cache"))
+    os.environ.setdefault("WANDB_ARTIFACTS_DIR", str(wandb_base / "artifacts"))
+    os.environ.setdefault("WANDB_ARTIFACT_DIR", str(wandb_base / "artifacts"))
+    os.environ.setdefault("WANDB_CONFIG_DIR", str(wandb_base / "config"))
+    os.environ.setdefault("WANDB_DATA_DIR", str(wandb_base / "data"))
+    os.environ.setdefault("WANDB_DISABLE_CODE", "true")
+    for key in ("WANDB_DIR", "WANDB_CACHE_DIR", "WANDB_ARTIFACTS_DIR", "WANDB_ARTIFACT_DIR", "WANDB_CONFIG_DIR", "WANDB_DATA_DIR"):
+        pathlib.Path(os.environ[key]).mkdir(parents=True, exist_ok=True)
+
+
 def configure():
     parser = argparse.ArgumentParser()
     parser.add_argument('--device', type=int, default=None,
@@ -58,6 +76,7 @@ def train(args):
 
     # Configure logger
     if args.logger == "wandb":
+        configure_wandb_paths()
         logdir = pathlib.Path(os.environ["NUGRAPH_LOG"])/args.name
         logdir.mkdir(parents=True, exist_ok=True)
         log_model = False if args.offline else "all"

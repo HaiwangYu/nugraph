@@ -168,15 +168,18 @@ def main(args):
     run_name = args.run_name
     logdir = log_base_dir / run_name
 
-    # W&B paths before WandbLogger is constructed
-    os.environ.setdefault("WANDB_DIR",           str(logdir / "wandb"))
-    os.environ.setdefault("WANDB_CACHE_DIR",     str(logdir / "wandb_cache"))
-    os.environ.setdefault("WANDB_ARTIFACTS_DIR", str(logdir / "wandb_artifacts"))
+    # W&B paths before WandbLogger is constructed. Keep all W&B writes off $HOME.
+    wandb_base = Path(os.environ.get("WANDB_BASE", "/lus/eagle/projects/neutrinoGPU/abhat/wandb"))
+    os.environ.setdefault("WANDB_DIR",           str(wandb_base / "run"))
+    os.environ.setdefault("WANDB_CACHE_DIR",     str(wandb_base / "cache"))
+    os.environ.setdefault("WANDB_ARTIFACTS_DIR", str(wandb_base / "artifacts"))
+    os.environ.setdefault("WANDB_ARTIFACT_DIR",  str(wandb_base / "artifacts"))
+    os.environ.setdefault("WANDB_CONFIG_DIR",    str(wandb_base / "config"))
+    os.environ.setdefault("WANDB_DATA_DIR",      str(wandb_base / "data"))
     os.environ.setdefault("WANDB_DISABLE_CODE",  "true")   # optional space saver
 
-    Path(os.environ["WANDB_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["WANDB_CACHE_DIR"]).mkdir(parents=True, exist_ok=True)
-    Path(os.environ["WANDB_ARTIFACTS_DIR"]).mkdir(parents=True, exist_ok=True)
+    for key in ("WANDB_DIR", "WANDB_CACHE_DIR", "WANDB_ARTIFACTS_DIR", "WANDB_ARTIFACT_DIR", "WANDB_CONFIG_DIR", "WANDB_DATA_DIR"):
+        Path(os.environ[key]).mkdir(parents=True, exist_ok=True)
 
     # Create dir on all ranks for consistency before logger tries to
     if not logdir.exists():
@@ -435,6 +438,26 @@ def main(args):
             dirpath=ckpt_dir,
         ),
     ]
+
+    if model_name == "nugraph4":
+        callbacks.extend(
+            [
+                pl.callbacks.ModelCheckpoint(
+                    monitor="instance/f1-val",
+                    mode="max",
+                    save_top_k=1,
+                    filename="best-instance-f1",
+                    dirpath=ckpt_dir,
+                ),
+                pl.callbacks.ModelCheckpoint(
+                    monitor="combined/semantic_instance_f1-val",
+                    mode="max",
+                    save_top_k=1,
+                    filename="best-joint-f1",
+                    dirpath=ckpt_dir,
+                ),
+            ]
+        )
 
 
     # --- Trainer configuration ---

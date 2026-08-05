@@ -203,3 +203,6 @@ set_affinity_gpu_polaris.sh
 *_OG.py
 worker_train.sh
 
+notebooks/viz_*/
+notebooks/bee_data_*/
+notebooks/bee_data_*.zip
