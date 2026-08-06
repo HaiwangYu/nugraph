@@ -164,16 +164,22 @@ class WCMLConverter:
 
         # semantic labels per blob from point-level is_nu
         semantic, frac_nu_hits = self._label_blobs(arrays.points, arrays.is_nu, len(corners), self.config)
+        semantic_truth_values = (
+            np.asarray(arrays.is_nu).reshape(-1)
+            if arrays.is_nu is not None
+            else np.empty((0,), dtype=np.int64)
+        )
+        has_semantic_truth = (
+            arrays.points is not None
+            and semantic_truth_values.shape[0] == arrays.points.shape[0]
+            and np.any(semantic_truth_values != -2)
+        )
 
         # reco cluster id per blob (mode of points[:,5] within each blob)
         reco_cluster_by_blob = self._reco_cluster_by_blob(arrays.points, n_blobs=centroids.shape[0])
 
-        # truth instance id per blob (prefer truth_blob_tid if present)
-        truth_instance_by_blob = self._truth_instance_by_blob(
-            arrays,
-            n_blobs=centroids.shape[0],
-            fallback=reco_cluster_by_blob,
-        )
+        # truth instance id per blob; missing truth remains unlabelled
+        truth_instance_by_blob = self._truth_instance_by_blob(arrays, n_blobs=centroids.shape[0])
 
         # --- Vertex-distance info per blob: DO NOT recompute in converter ---
         # Labeling already computed per-HIT vtx_dist/dx/dy/dz in *cm*.
@@ -420,6 +426,8 @@ class WCMLConverter:
             truth_instance_by_blob=truth_instance_by_blob,
             semantic=semantic,
             vtx_dist_by_blob=vtx_dist_by_blob,
+            centroids=centroids,
+            reco_cluster_by_blob=reco_cluster_by_blob,
         )
 
 
@@ -427,7 +435,9 @@ class WCMLConverter:
         # ==================== PRUNING FIX START ====================
         # PRUNE MP EDGES TOUCHING GHOSTS
         mp_edge_index = np.asarray(mp_edge_index, dtype=np.int64)
-        if mp_edge_index.ndim == 2 and mp_edge_index.shape[0] == 2 and mp_edge_index.shape[1] > 0:
+        if mp_edge_index.ndim != 2 or mp_edge_index.shape[0] != 2:
+            mp_edge_index = np.empty((2, 0), dtype=np.int64)
+        elif has_semantic_truth and mp_edge_index.shape[1] > 0:
             ghost_mask = (encoded_semantic == -1)
             Nsp = int(ghost_mask.shape[0])
         
@@ -438,8 +448,6 @@ class WCMLConverter:
             keep = in_range & (~ghost_mask[src]) & (~ghost_mask[dst])
         
             mp_edge_index = mp_edge_index[:, keep]
-        else:
-            mp_edge_index = np.empty((2, 0), dtype=np.int64)
         # ==================== PRUNING FIX END ====================
                 
                         
@@ -547,8 +555,10 @@ class WCMLConverter:
 
         if (encoded_semantic == 0).any():
             graph["evt"].y = torch.tensor([1], dtype=torch.long)
-        else:
+        elif (encoded_semantic >= 0).any():
             graph["evt"].y = torch.tensor([0], dtype=torch.long)
+        else:
+            graph["evt"].y = torch.tensor([-1], dtype=torch.long)
 
 
         return graph
@@ -576,16 +586,14 @@ class WCMLConverter:
             out[b] = int(vals[np.argmax(cnt)])
         return out
 
-    def _truth_instance_by_blob(self, arrays: WCMLArrays, n_blobs: int, fallback: np.ndarray) -> np.ndarray:
-        """
-        Prefer truth_blob_tid when present; else fall back to reco clusters.
-        """
+    def _truth_instance_by_blob(self, arrays: WCMLArrays, n_blobs: int) -> np.ndarray:
+        """Return blob-level truth instance IDs, or -1 when truth is unavailable."""
         tid = getattr(arrays, "truth_blob_tid", None)
         if tid is not None:
             tid = np.asarray(tid).reshape(-1)
             if tid.shape[0] == n_blobs:
                 return tid.astype(np.int64)
-        return fallback.astype(np.int64)
+        return np.full((n_blobs,), -1, dtype=np.int64)
 
 
     def _get_blob_mp_edges(self, arrays: WCMLArrays, n_blobs: int) -> np.ndarray:
@@ -602,6 +610,192 @@ class WCMLConverter:
         # ensure in-range / unique undirected
         ei_blob = self._unique_undirected_edges(ei_blob, n_blobs)
         return ei_blob
+
+    @staticmethod
+    def _empty_edge_index() -> np.ndarray:
+        return np.empty((2, 0), dtype=np.int64)
+
+    def _normalize_edge_index(self, edge_index) -> np.ndarray:
+        """Normalize an edge array to int64 shape ``(2, E)``."""
+        if edge_index is None:
+            return self._empty_edge_index()
+
+        normalized = np.asarray(edge_index)
+        if normalized.size == 0 or normalized.ndim != 2:
+            return self._empty_edge_index()
+        if normalized.shape[0] == 2:
+            return normalized.astype(np.int64, copy=False)
+        if normalized.shape[1] == 2:
+            return normalized.T.astype(np.int64, copy=False)
+        return self._empty_edge_index()
+
+    def _point_edges_to_blob_edges(
+        self,
+        point_edge_index,
+        point_to_blob: np.ndarray,
+        n_blobs: int,
+    ) -> np.ndarray:
+        """Map reconstruction point edges to unique blob-level edges."""
+        normalized = self._normalize_edge_index(point_edge_index)
+        if normalized.shape[1] == 0:
+            return self._empty_edge_index()
+
+        point_to_blob = np.asarray(point_to_blob, dtype=np.int64).reshape(-1)
+        n_points = int(point_to_blob.shape[0])
+        source_points = normalized[0]
+        target_points = normalized[1]
+        valid_points = (
+            (source_points >= 0)
+            & (target_points >= 0)
+            & (source_points < n_points)
+            & (target_points < n_points)
+        )
+        if not np.any(valid_points):
+            return self._empty_edge_index()
+
+        source_blobs = point_to_blob[source_points[valid_points]]
+        target_blobs = point_to_blob[target_points[valid_points]]
+        valid_blobs = (
+            (source_blobs >= 0)
+            & (target_blobs >= 0)
+            & (source_blobs < n_blobs)
+            & (target_blobs < n_blobs)
+            & (source_blobs != target_blobs)
+        )
+        if not np.any(valid_blobs):
+            return self._empty_edge_index()
+
+        blob_edges = np.stack([source_blobs[valid_blobs], target_blobs[valid_blobs]], axis=0)
+        return self._unique_undirected_edges(blob_edges, n_blobs)
+
+    def _blob_knn_radius_edges(
+        self,
+        centroids: np.ndarray | None,
+        k: int = 8,
+        radius_mm: float = 80.0,
+    ) -> np.ndarray:
+        """Build geometry-only kNN and radius candidates from blob centroids."""
+        if centroids is None:
+            return self._empty_edge_index()
+
+        all_centroids = np.asarray(centroids, dtype=np.float32)
+        if all_centroids.ndim != 2 or all_centroids.shape[0] <= 1:
+            return self._empty_edge_index()
+
+        n_blobs = int(all_centroids.shape[0])
+        finite_mask = np.all(np.isfinite(all_centroids), axis=1)
+        if np.count_nonzero(finite_mask) <= 1:
+            return self._empty_edge_index()
+
+        blob_indices = np.nonzero(finite_mask)[0].astype(np.int64)
+        finite_centroids = all_centroids[finite_mask]
+        n_finite = int(finite_centroids.shape[0])
+        edges: list[tuple[int, int]] = []
+
+        if _HAS_SKLEARN:
+            n_neighbors = max(1, min(int(k) + 1, n_finite))
+            nearest = NearestNeighbors(n_neighbors=n_neighbors, algorithm="kd_tree")
+            nearest.fit(finite_centroids)
+            neighbor_indices = nearest.kneighbors(finite_centroids, return_distance=False)
+            for local_source, local_targets in enumerate(neighbor_indices):
+                source_blob = int(blob_indices[local_source])
+                for local_target in np.atleast_1d(local_targets):
+                    target_blob = int(blob_indices[int(local_target)])
+                    if source_blob != target_blob:
+                        edges.append((source_blob, target_blob))
+
+            if radius_mm > 0.0:
+                radius_neighbors = NearestNeighbors(radius=float(radius_mm), algorithm="kd_tree")
+                radius_neighbors.fit(finite_centroids)
+                neighbor_indices = radius_neighbors.radius_neighbors(
+                    finite_centroids,
+                    return_distance=False,
+                )
+                for local_source, local_targets in enumerate(neighbor_indices):
+                    source_blob = int(blob_indices[local_source])
+                    for local_target in np.atleast_1d(local_targets):
+                        target_blob = int(blob_indices[int(local_target)])
+                        if source_blob != target_blob:
+                            edges.append((source_blob, target_blob))
+        else:
+            n_neighbors = max(1, min(int(k), n_finite - 1))
+            radius_squared = float(radius_mm) ** 2 if radius_mm > 0.0 else -1.0
+            for local_source in range(n_finite):
+                displacement = finite_centroids - finite_centroids[local_source]
+                distance_squared = np.einsum("ij,ij->i", displacement, displacement)
+                distance_squared[local_source] = np.inf
+                nearest_indices = np.argpartition(
+                    distance_squared,
+                    kth=n_neighbors - 1,
+                )[:n_neighbors]
+                source_blob = int(blob_indices[local_source])
+                for local_target in nearest_indices:
+                    edges.append((source_blob, int(blob_indices[int(local_target)])))
+                if radius_squared > 0.0:
+                    for local_target in np.nonzero(distance_squared <= radius_squared)[0]:
+                        edges.append((source_blob, int(blob_indices[int(local_target)])))
+
+        if not edges:
+            return self._empty_edge_index()
+        return self._unique_undirected_edges(np.asarray(edges, dtype=np.int64).T, n_blobs)
+
+    def _cluster_neighbor_edges(
+        self,
+        reco_cluster_by_blob: np.ndarray | None,
+        centroids: np.ndarray | None,
+        k_per_cluster: int = 4,
+    ) -> np.ndarray:
+        """Connect nearby blobs within each reconstruction-defined cluster."""
+        if reco_cluster_by_blob is None or centroids is None:
+            return self._empty_edge_index()
+
+        cluster_ids = np.asarray(reco_cluster_by_blob, dtype=np.int64).reshape(-1)
+        all_centroids = np.asarray(centroids, dtype=np.float32)
+        if all_centroids.ndim != 2 or all_centroids.shape[0] != cluster_ids.shape[0]:
+            return self._empty_edge_index()
+
+        n_blobs = int(cluster_ids.shape[0])
+        edges: list[tuple[int, int]] = []
+        for cluster_id in np.unique(cluster_ids):
+            if cluster_id < 0:
+                continue
+
+            blob_indices = np.nonzero(cluster_ids == cluster_id)[0].astype(np.int64)
+            finite_mask = np.all(np.isfinite(all_centroids[blob_indices]), axis=1)
+            blob_indices = blob_indices[finite_mask]
+            cluster_centroids = all_centroids[blob_indices]
+            n_cluster = int(blob_indices.shape[0])
+            if n_cluster <= 1:
+                continue
+
+            if _HAS_SKLEARN:
+                n_neighbors = max(1, min(int(k_per_cluster) + 1, n_cluster))
+                nearest = NearestNeighbors(n_neighbors=n_neighbors, algorithm="kd_tree")
+                nearest.fit(cluster_centroids)
+                neighbor_indices = nearest.kneighbors(cluster_centroids, return_distance=False)
+                for local_source, local_targets in enumerate(neighbor_indices):
+                    source_blob = int(blob_indices[local_source])
+                    for local_target in np.atleast_1d(local_targets):
+                        target_blob = int(blob_indices[int(local_target)])
+                        if source_blob != target_blob:
+                            edges.append((source_blob, target_blob))
+            else:
+                n_neighbors = max(1, min(int(k_per_cluster), n_cluster - 1))
+                for local_source in range(n_cluster):
+                    displacement = cluster_centroids - cluster_centroids[local_source]
+                    distance_squared = np.einsum("ij,ij->i", displacement, displacement)
+                    distance_squared[local_source] = np.inf
+                    nearest_indices = np.argpartition(
+                        distance_squared,
+                        kth=n_neighbors - 1,
+                    )[:n_neighbors]
+                    source_blob = int(blob_indices[local_source])
+                    for local_target in nearest_indices:
+                        edges.append((source_blob, int(blob_indices[int(local_target)])))
+
+        if not edges:
+            return self._empty_edge_index()
+        return self._unique_undirected_edges(np.asarray(edges, dtype=np.int64).T, n_blobs)
     
     def _get_blob_sup_edges_and_labels(
             self,
@@ -610,54 +804,86 @@ class WCMLConverter:
             truth_instance_by_blob: np.ndarray,
             semantic: np.ndarray,
             vtx_dist_by_blob: np.ndarray,
+            centroids: np.ndarray | None = None,
+            reco_cluster_by_blob: np.ndarray | None = None,
         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             """
-            Supervision edges: use arrays.edge_index if present.
-            CRITICAL FIX: Always treat input edges as POINT indices and map to BLOBS.
-            Removed the heuristic "max_idx < n_blobs" which caused silent corruption.
+            Build blob candidates from reconstruction/geometry, then label with truth.
             """
+            if n_blobs <= 0:
+                return self._empty_edge_index(), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
+
             points = getattr(arrays, "points", None)
-            if points is None or points.size == 0:
-                return (np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64))
-    
-            blob_of_point = points[:, 4].astype(np.int64)
-            n_points = int(points.shape[0])
-    
-            edge_index = getattr(arrays, "edge_index", None)
-            if edge_index is None:
-                return (np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64))
-    
-            ei = np.asarray(edge_index, dtype=np.int64)
-            if ei.ndim != 2 or ei.shape[0] != 2 or ei.shape[1] == 0:
-                return (np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64))
-    
-            # SAFETY CHECK: If indices exceed point count, the data is invalid for this assumption
-            if ei.max() >= n_points:
-                 return (np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64))
-    
-            # ALWAYS map Point -> Blob
-            src_p = ei[0].astype(np.int64)
-            dst_p = ei[1].astype(np.int64)
-            
-            src_b = blob_of_point[src_p]
-            dst_b = blob_of_point[dst_p]
-    
-            # Keep edges where both endpoints map to valid blobs, and are different blobs
-            m = (
-                (src_b >= 0) & (dst_b >= 0) &
-                (src_b < n_blobs) & (dst_b < n_blobs) &
-                (src_b != dst_b)
+            candidate_edges: list[np.ndarray] = []
+            source_counts: dict[str, int] = {}
+            if points is not None:
+                points = np.asarray(points)
+                if points.ndim == 2 and points.shape[1] >= 5 and points.shape[0] > 0:
+                    point_to_blob = points[:, 4].astype(np.int64, copy=False)
+                    existing_edges = self._point_edges_to_blob_edges(
+                        getattr(arrays, "edge_index", None),
+                        point_to_blob,
+                        n_blobs,
+                    )
+                    candidate_edges.append(existing_edges)
+                    source_counts["edge_index"] = int(existing_edges.shape[1])
+
+                    ppedges = getattr(arrays, "ppedges", None)
+                    if ppedges is not None and np.asarray(ppedges).size > 0:
+                        try:
+                            _, mapped_ppedges = self._ppedges_to_blobedges(np.asarray(ppedges), points)
+                            mapped_ppedges = self._unique_undirected_edges(mapped_ppedges, n_blobs)
+                        except (IndexError, TypeError, ValueError) as error:
+                            if self.config.write_diagnostics:
+                                print(f"[WARN] failed to map ppedges to blob edges: {error}", flush=True)
+                            mapped_ppedges = self._empty_edge_index()
+                        candidate_edges.append(mapped_ppedges)
+                        source_counts["ppedges"] = int(mapped_ppedges.shape[1])
+
+            geometry_edges = self._blob_knn_radius_edges(centroids, k=8, radius_mm=80.0)
+            candidate_edges.append(geometry_edges)
+            source_counts["geom_knn_radius"] = int(geometry_edges.shape[1])
+
+            cluster_edges = self._cluster_neighbor_edges(
+                reco_cluster_by_blob,
+                centroids,
+                k_per_cluster=4,
             )
-            if not np.any(m):
-                return (np.empty((2, 0), dtype=np.int64), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64))
-    
-            a = np.minimum(src_b[m], dst_b[m])
-            b = np.maximum(src_b[m], dst_b[m])
-            pairs = np.stack([a, b], axis=1)
-            pairs_u = np.unique(pairs, axis=0).astype(np.int64)
-            ei_blob = np.stack([pairs_u[:, 0], pairs_u[:, 1]], axis=0)
-            
-            return self._label_blob_edges(ei_blob, truth_instance_by_blob, semantic, vtx_dist_by_blob)
+            candidate_edges.append(cluster_edges)
+            source_counts["reco_cluster"] = int(cluster_edges.shape[1])
+
+            nonempty_edges = [
+                self._normalize_edge_index(edge_index)
+                for edge_index in candidate_edges
+                if edge_index is not None and np.asarray(edge_index).size > 0
+            ]
+            if nonempty_edges:
+                edge_index = self._unique_undirected_edges(
+                    np.concatenate(nonempty_edges, axis=1),
+                    n_blobs,
+                )
+            else:
+                edge_index = self._empty_edge_index()
+
+            edge_index, edge_y, edge_labelable = self._label_blob_edges(
+                edge_index,
+                truth_instance_by_blob,
+                semantic,
+                vtx_dist_by_blob,
+            )
+            if self.config.write_diagnostics:
+                labelable = np.asarray(edge_labelable, dtype=np.int64).reshape(-1)
+                labels = np.asarray(edge_y, dtype=np.int64).reshape(-1)
+                print(
+                    "[sp-candidates] "
+                    f"n_blobs={n_blobs} sources={source_counts} "
+                    f"union_edges={edge_index.shape[1]} "
+                    f"labelable={int(labelable.sum()) if labelable.size else 0} "
+                    f"pos={int(((labels == 1) & (labelable == 1)).sum()) if labels.size else 0} "
+                    f"neg={int(((labels == 0) & (labelable == 1)).sum()) if labels.size else 0}",
+                    flush=True,
+                )
+            return edge_index, edge_y, edge_labelable
     
     def _unique_undirected_edges(self, edge_index: np.ndarray, n_nodes: int) -> np.ndarray:
         """
@@ -901,14 +1127,14 @@ class WCMLConverter:
                     node_truth_instances[node_idx].append(int(truth_instance_by_blob[blob_id]))
                     node_blobs[node_idx].append(blob_id)
 
-        labels = np.full(len(positions), self.config.semantic_negative, dtype=np.int64)
+        labels = np.full(len(positions), -2, dtype=np.int64)
         for node_idx, linked_labels in enumerate(node_semantics):
             if not linked_labels:
                 continue
             if any(lbl == self.config.semantic_positive for lbl in linked_labels):
                 labels[node_idx] = self.config.semantic_positive
-            else:
-                labels[node_idx] = linked_labels[0]
+            elif any(lbl == self.config.semantic_negative for lbl in linked_labels):
+                labels[node_idx] = self.config.semantic_negative
 
         # Plane-node instance = mode of linked blob truth instances (ignore -1)
         instances = np.full(len(positions), -1, dtype=np.int64)
@@ -1098,16 +1324,20 @@ class WCMLConverter:
         config: ConversionConfig,
     ) -> tuple[np.ndarray, np.ndarray]:
         if points is None or points.size == 0:
-            return np.full((n_expected,), config.semantic_negative, dtype=np.int64), np.zeros((n_expected,), dtype=np.float32)
+            return np.full((n_expected,), -2, dtype=np.int64), np.zeros((n_expected,), dtype=np.float32)
 
         blob_indices = points[:, 4].astype(int)
         inferred = int(blob_indices.max()) + 1 if blob_indices.size else 0
         n_blobs = max(inferred, n_expected)
 
-        labels = np.full(n_blobs, config.semantic_negative, dtype=np.int64)
+        labels = np.full(n_blobs, -2, dtype=np.int64)
         frac_nu_hits = np.zeros(n_blobs, dtype=np.float32)
 
         if is_nu is None:
+            return labels, frac_nu_hits
+
+        is_nu = np.asarray(is_nu).reshape(-1)
+        if is_nu.shape[0] != points.shape[0]:
             return labels, frac_nu_hits
 
         for blob_id in range(labels.size):
@@ -1321,7 +1551,7 @@ def convert_npz_directory(
 ) -> Path:
     converter = WCMLConverter(config)
     directory = Path(directory)
-    paths = sorted(p for p in directory.rglob("rec-lab-*.npz") if p.is_file())
+    paths = sorted(p for p in directory.rglob("*.npz") if p.is_file())
     graphs = converter.convert_many(paths, workers=workers)
     converter.write_hdf5(graphs, output)
     return Path(output)

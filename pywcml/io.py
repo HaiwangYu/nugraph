@@ -21,6 +21,13 @@ class WCMLArrays:
     vtx_dx: Optional[np.ndarray]
     vtx_dy: Optional[np.ndarray]
     vtx_dz: Optional[np.ndarray]
+    nu_vtx: Optional[np.ndarray]
+    nu_vtx_found: Optional[np.ndarray]
+    truth_blob_tid: Optional[np.ndarray]
+    truth_blob_purity: Optional[np.ndarray]
+    truth_blob_support: Optional[np.ndarray]
+    edge_index: Optional[np.ndarray]
+    edge_y: Optional[np.ndarray]
     # Keep track of origin path (converter uses this)
     path: Path
 
@@ -33,36 +40,36 @@ def load_npz(path: Path | str) -> WCMLArrays:
       - required: blobs, points
       - ctpc_* plane arrays
       - optional: is_nu, origin_label, ppedges
-      - optional: vtx_dist, vtx_dx, vtx_dy, vtx_dz
+      - optional: vtx_dist, vtx_dx, vtx_dy, vtx_dz, nu_vtx, nu_vtx_found
+      - optional: truth_blob_tid, truth_blob_purity, truth_blob_support
+      - optional: edge_index, edge_y
     """
     path = Path(path)
-    data = np.load(path)
+    with np.load(path, allow_pickle=False) as data:
+        blobs = data["blobs"]
+        points = data["points"]
+        ctpc = {key: data[key] for key in data.files if key.startswith("ctpc_")}
 
-    # Required
-    blobs = data["blobs"]
-    points = data["points"]
+        def optional(key: str) -> Optional[np.ndarray]:
+            return data[key] if key in data.files else None
 
-    # ctpc_* planes
-    ctpc: Dict[str, np.ndarray] = {}
-    for key in data.files:
-        if key.startswith("ctpc_"):
-            ctpc[key] = data[key]
+        is_nu = optional("is_nu")
+        origin_label = optional("origin_label")
+        ppedges = optional("ppedges")
+        if ppedges is None:
+            ppedges = np.empty((0, 3), dtype=np.float32)
 
-    # Optional truth / labels
-    is_nu = data["is_nu"] if "is_nu" in data.files else None
-    origin_label = data["origin_label"] if "origin_label" in data.files else None
-
-    # Optional edges
-    if "ppedges" in data.files:
-        ppedges = data["ppedges"]
-    else:
-        ppedges = np.empty((0, 3), dtype=np.float32)
-
-    # Optional neutrino-vertex geometry per hit
-    vtx_dist = data["vtx_dist"] if "vtx_dist" in data.files else None
-    vtx_dx   = data["vtx_dx"]   if "vtx_dx"   in data.files else None
-    vtx_dy   = data["vtx_dy"]   if "vtx_dy"   in data.files else None
-    vtx_dz   = data["vtx_dz"]   if "vtx_dz"   in data.files else None
+        vtx_dist = optional("vtx_dist")
+        vtx_dx = optional("vtx_dx")
+        vtx_dy = optional("vtx_dy")
+        vtx_dz = optional("vtx_dz")
+        nu_vtx = optional("nu_vtx")
+        nu_vtx_found = optional("nu_vtx_found")
+        truth_blob_tid = optional("truth_blob_tid")
+        truth_blob_purity = optional("truth_blob_purity")
+        truth_blob_support = optional("truth_blob_support")
+        edge_index = optional("edge_index")
+        edge_y = optional("edge_y")
 
     return WCMLArrays(
         blobs=blobs,
@@ -75,5 +82,12 @@ def load_npz(path: Path | str) -> WCMLArrays:
         vtx_dx=vtx_dx,
         vtx_dy=vtx_dy,
         vtx_dz=vtx_dz,
+        nu_vtx=nu_vtx,
+        nu_vtx_found=nu_vtx_found,
+        truth_blob_tid=truth_blob_tid,
+        truth_blob_purity=truth_blob_purity,
+        truth_blob_support=truth_blob_support,
+        edge_index=edge_index,
+        edge_y=edge_y,
         path=path,
     )

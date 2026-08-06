@@ -51,6 +51,23 @@ class ConversionConfig:
     projection_tolerance: float = 0.0  # mm tolerance between projected and observed wire coordinates
     pitch_gap_tolerance: float = 6.0  # mm gap that breaks contiguous CTPC stripes into distinct nodes
     detect_planes_from_name: bool = True
+    enable_sidecar_features: bool = False
+    enable_local_pca: bool = False
+    enable_event_bbox_wall_dists: bool = False
+    enable_vertex_semantic_fix: bool = False
+    enable_semantic_mp_propagation_fix: bool = False
+    merge_sup_edges_into_mp: bool = False
+    write_diagnostics: bool = False
+    sidecar_k: int = 12
+    mp_prop_seed_frac_nu_min: float = 0.60
+    mp_prop_seed_vtx_radius_mm: float = 100.0
+    mp_prop_edge_len_max_mm: float = 225.0
+    mp_prop_max_hops: int = 5
+    mp_prop_max_vtx_dist_mm: float = 2000.0
+
+    def __post_init__(self) -> None:
+        if self.enable_local_pca and not self.enable_sidecar_features:
+            raise ValueError("enable_local_pca=True requires enable_sidecar_features=True")
 
     def plane_names(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.planes.values())
