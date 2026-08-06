@@ -60,31 +60,25 @@ def _as_float(a):
 
 def remap_negative_trackids(tid: np.ndarray) -> np.ndarray:
     """
-    Remap negative trackIds (except -1) to unique positive IDs.
+    Canonicalize LArSoft/WireCell-style negative secondary track IDs.
 
-    Keeps:
-      -1 as -1 (unlabeled)
+    Convention used here:
+      -1      -> unlabeled, keep as -1
+      tid < -1 -> secondary/deposit label; fold back to abs(tid)
 
-    Maps:
-      tid < -1  --> new positive IDs, stable within this array
+    This maps:
+      -169    -> 169
+      -58157  -> 58157
+
+    so delta rays / bremsstrahlung deposits are associated with the parent
+    cosmic/eve track instead of becoming separate instance labels.
     """
-    tid = tid.copy()
+    tid = np.asarray(tid).astype(np.int64, copy=True)
 
-    neg = tid < -1
-    if not np.any(neg):
-        return tid
+    secondary = tid < -1
+    tid[secondary] = -tid[secondary]
 
-    # start new IDs above the current max positive
-    max_pos = int(tid[tid >= 0].max()) if np.any(tid >= 0) else 0
-    neg_vals = np.unique(tid[neg])
-
-    mapping = {int(v): (max_pos + 1 + i) for i, v in enumerate(neg_vals)}
-
-    # vectorized remap
-    for v, newv in mapping.items():
-        tid[tid == v] = newv
-
-    return tid
+    return tid.astype(np.int32, copy=False)
 
 
 
@@ -1010,17 +1004,17 @@ def process_entry(
             tid_by_plane=tid_by_plane,
             max_dist_mm=float(max_dist_mm),
         )
-        
+        out["truth_tid_points_direct_raw"] = tid_points_direct.astype(np.int32, copy=False)
         # -------------------------
         # FIX: remap negative tids on DIRECT point labels too
         # so they don't get dropped later and so debug prints make sense
         # -------------------------
         tid_points_direct = remap_negative_trackids(tid_points_direct.astype(np.int32))
-        
+
         out["truth_tid_points_direct"] = tid_points_direct.astype(np.int32, copy=False)
         out["truth_tid_points_direct_support"] = support_direct.astype(np.int16, copy=False)
         out["truth_tid_points_direct_meta_p2_used"] = np.array([meta.get("p2", {}).get("used", -1)], dtype=np.int32)
-        
+
         # blob propagation (now uses the remapped direct labels)
         tid_points, blob_tid, blob_purity, blob_support = blob_propagate_truth(
             points=out["points"],
@@ -1028,7 +1022,7 @@ def process_entry(
             purity_thr=float(purity_thr),
             min_blob_support=int(min_blob_support),
         )
-        
+
 
         # ------------------------------------------------------------
         # FIX: Remap negative trackIds to positive unique values
@@ -1060,11 +1054,11 @@ def process_entry(
         # recompute blob truth stats from merged point tids (consistent trio)
         blob_id = out["points"][:,4].astype(np.int64, copy=False)
         n_blobs = int(blob_id.max()) + 1 if blob_id.size else 0
-        
+
         blob_tid2 = np.full(n_blobs, -1, dtype=np.int32)
         blob_purity2 = np.zeros(n_blobs, dtype=np.float32)
         blob_support2 = np.zeros(n_blobs, dtype=np.int16)
-        
+
         for b in range(n_blobs):
             m = (blob_id == b)
             tt = tid_points[m]
@@ -1076,15 +1070,15 @@ def process_entry(
             blob_tid2[b] = np.int32(u[k])
             blob_support2[b] = np.int16(int(c.sum()))
             blob_purity2[b] = np.float32(float(c[k] / c.sum()))
-        
+
         blob_tid, blob_purity, blob_support = blob_tid2, blob_purity2, blob_support2
 
         out["truth_blob_tid"] = blob_tid.astype(np.int32, copy=False)
 
 
-        
+
         out["truth_tid_points"] = tid_points.astype(np.int32, copy=False)
-        
+
         out["truth_blob_purity"] = blob_purity.astype(np.float32, copy=False)
         out["truth_blob_support"] = blob_support.astype(np.int16, copy=False)
 

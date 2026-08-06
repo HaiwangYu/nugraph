@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-batch_labeling_scratch.py
+batch_run_labeling_with_truth_EAF.py
 
 Streams reco (img-clus) + truth (celltree0/celltree1) from PNFS via XRootD
 into per-job LOCAL scratch folders, runs labeling_with_truth_fixed.py, then
@@ -36,8 +36,8 @@ import threading
 import re
 from typing import List, Tuple, Dict, Any
 
-# Runtime locations are environment-driven; scientific labeling options below
-# remain identical to the authoritative production workflow.
+# Runtime locations are environment-driven; NCPi0-specific handling and
+# scientific labeling options remain unchanged.
 XRDFS_HOST = os.environ.get("XRD_HOST", "fndcadoor.fnal.gov:1094")
 XRDCP_PREFIX = f"root://{XRDFS_HOST}"
 
@@ -45,7 +45,7 @@ PNFS_RECO_BASE = os.environ.get("NUGRAPH_RECO_BASE", "")
 PNFS_TRUTH_APA0_BASE = os.environ.get("NUGRAPH_TRUTH_APA0_BASE", "")
 PNFS_TRUTH_APA1_BASE = os.environ.get("NUGRAPH_TRUTH_APA1_BASE", "")
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
-LOCAL_OUTPUT_BASE = Path(os.environ.get("NUGRAPH_LOCAL_OUTPUT_BASE", "labeled_samples"))
+LOCAL_OUTPUT_BASE = Path(os.environ.get("NUGRAPH_LOCAL_OUTPUT_BASE", "labeled_samples_ncpi0"))
 PNFS_OUTPUT_BASE = os.environ.get("NUGRAPH_PNFS_OUTPUT_BASE", "")
 
 # What to stage out (relative to local job dir)
@@ -68,10 +68,10 @@ JOB_START = int(os.environ.get("NUGRAPH_JOB_START", "0"))
 JOB_END = int(os.environ.get("NUGRAPH_JOB_END", "-1"))
 
 # Concurrency / safety
-MAX_WORKERS = int(os.environ.get("NUGRAPH_MAX_WORKERS", "48"))
+MAX_WORKERS = int(os.environ.get("NUGRAPH_MAX_WORKERS", "2"))
 XRDCP_RETRIES = 3
 XRDCP_RETRY_DELAY = 2.0
-BATCH_ENTRY_CHUNK = 16
+BATCH_ENTRY_CHUNK = 4
 PYTHON_BIN = sys.executable
 
 # Cleanup policy:
@@ -317,14 +317,62 @@ def probe_max_index_in_reco_folder(reco_pnfs_folder: str):
     return max0, max1
 
 
-def folder_exists_remote(pnfs_folder: str) -> bool:
-    if not shutil.which("xrdfs"):
-        # If xrdfs missing, we can't cheaply check; assume yes and let xrdcp fail loudly
-        return True
-    parent = str(Path(pnfs_folder).parent)
-    name = str(Path(pnfs_folder).name)
-    entries = list_remote_files_via_xrdfs(parent)
-    return any(e.endswith("/" + name) or e.endswith(name) for e in entries)
+def folder_exists_remote(path: str) -> bool:
+    """
+    Check remote PNFS/XRootD folder existence.
+
+    Critical behavior:
+      - real missing folder -> False
+      - auth/XRootD failure -> refresh token and retry
+      - persistent unexpected failure -> raise, not silently skip
+    """
+    import os
+    import subprocess
+    import time
+
+    os.environ["BEARER_TOKEN_FILE"] = f"/tmp/bt_u{os.getuid()}"
+
+    def refresh_token():
+        logging.warning("[XROOTD] refreshing SBND token before retry")
+        q = subprocess.run(
+            ["htgettoken", "-i", "sbnd", "--vaultserver", "htvaultprod.fnal.gov"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=180,
+        )
+        msg = (q.stdout or "") + "\n" + (q.stderr or "")
+        if q.returncode != 0:
+            raise RuntimeError(f"htgettoken failed while checking {path}: {msg[-1000:]}")
+
+    last_msg = ""
+    for attempt in range(1, 4):
+        q = subprocess.run(
+            ["xrdfs", XRDFS_HOST, "ls", path],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        msg = (q.stdout or "") + "\n" + (q.stderr or "")
+        last_msg = msg
+
+        if q.returncode == 0:
+            return True
+
+        if "Auth failed" in msg or "No protocols left to try" in msg or "Could not get bearer token" in msg:
+            logging.warning("[XROOTD] auth failure checking %s, attempt %d/3", path, attempt)
+            refresh_token()
+            time.sleep(2 * attempt)
+            continue
+
+        if "Unable to locate" in msg or "No such file" in msg or "not found" in msg:
+            return False
+
+        # Other XRootD transient issue: retry, but do not call it missing.
+        logging.warning("[XROOTD] non-auth failure checking %s, attempt %d/3: %s", path, attempt, msg[-500:])
+        time.sleep(2 * attempt)
+
+    raise RuntimeError(f"xrdfs folder check failed after retries for {path}: {last_msg[-1000:]}")
 
 
 def stream_celltree_roots(ct0_folder: str, ct1_folder: str, out_folder: Path):
@@ -469,6 +517,30 @@ def run_labeling_in_folder(out_folder: Path, apa: str, start_idx: int, end_idx: 
     return (proc.returncode == 0), str(logname)
 
 
+
+def existing_remote_rec_indices(reco_folder: str, apa: str) -> list[int]:
+    """
+    Return exactly the reco indices that exist remotely for one APA.
+
+    This avoids assuming indices are contiguous from 0..max, which is false
+    for some _4 folders and causes xrdcp "No such file" errors.
+    """
+    import re
+
+    files = list_remote_files_via_xrdfs(reco_folder)
+    rx = re.compile(rf"/rec-{apa}-(\d+)\.npz$")
+    out = []
+    for f in files:
+        m = rx.search(f)
+        if m:
+            out.append(int(m.group(1)))
+    return sorted(set(out))
+
+
+def chunks_from_indices(indices: list[int], chunk_size: int) -> list[list[int]]:
+    return [indices[i:i + chunk_size] for i in range(0, len(indices), chunk_size)]
+
+
 def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
     job_name = os.path.basename(reco_folder)
     logging.info("[JOB] Starting %s", job_name)
@@ -528,17 +600,72 @@ def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
 
     results: Dict[str, Any] = {"apa0": [], "apa1": [], "stageout": None}
 
-    # apa1 then apa0
-    for apa, max_event, truth_folder in (
-        ("apa1", max1, ct1_folder),
-        ("apa0", max0, ct0_folder),
+    def remote_indices(folder: str, prefix: str) -> set[int]:
+        """
+        Return indices for files like rec-apa0-3.npz or tru-apa0-3.json.
+        This uses the current remote listing and does not assume contiguous files.
+        """
+        import re
+        files = list_remote_files_via_xrdfs(folder)
+        rx = re.compile(rf"/{prefix}-(\d+)\.(npz|json)$")
+        out = set()
+        for f in files:
+            m = rx.search(f)
+            if m:
+                out.add(int(m.group(1)))
+        return out
+
+    def contiguous_chunks(indices, chunk_size):
+        """
+        Convert existing indices into contiguous [start,end] chunks.
+        Example: [0,1,2,4,5,6,7,8,9] with chunk_size=4
+             -> [(0,2), (4,7), (8,9)]
+        """
+        indices = sorted(set(indices))
+        if not indices:
+            return []
+
+        runs = []
+        run_start = indices[0]
+        prev = indices[0]
+
+        for x in indices[1:]:
+            if x == prev + 1 and (x - run_start + 1) <= chunk_size:
+                prev = x
+            else:
+                runs.append((run_start, prev))
+                run_start = x
+                prev = x
+        runs.append((run_start, prev))
+        return runs
+
+    # apa1 then apa0. Process only entries where both reco NPZ and truth JSON exist.
+    for apa, truth_folder in (
+        ("apa1", ct1_folder),
+        ("apa0", ct0_folder),
     ):
-        if max_event < 0:
+        rec_idx = remote_indices(reco_folder, f"rec-{apa}")
+        tru_idx = remote_indices(truth_folder, f"tru-{apa}")
+
+        valid_idx = sorted(rec_idx & tru_idx)
+        missing_rec = sorted(tru_idx - rec_idx)
+        missing_tru = sorted(rec_idx - tru_idx)
+
+        logging.info(
+            "[JOB %s] %s existing indices: rec=%d truth=%d valid=%d missing_rec=%d missing_truth=%d",
+            job_name, apa, len(rec_idx), len(tru_idx), len(valid_idx), len(missing_rec), len(missing_tru)
+        )
+
+        if not valid_idx:
+            results[apa].append(("no_valid_indices", None, None, {
+                "rec_n": len(rec_idx),
+                "truth_n": len(tru_idx),
+                "missing_rec": missing_rec[:20],
+                "missing_truth": missing_tru[:20],
+            }))
             continue
 
-        for start in range(0, max_event + 1, BATCH_ENTRY_CHUNK):
-            end = min(max_event, start + BATCH_ENTRY_CHUNK - 1)
-
+        for start, end in contiguous_chunks(valid_idx, BATCH_ENTRY_CHUNK):
             ok_stream, local_files, errs = stream_needed_files(
                 reco_folder=reco_folder,
                 truth_folder=truth_folder,

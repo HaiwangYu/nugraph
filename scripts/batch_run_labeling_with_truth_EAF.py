@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """
-batch_labeling_scratch.py
+batch_run_labeling_with_truth_EAF.py
 
 Streams reco (img-clus) + truth (celltree0/celltree1) from PNFS via XRootD
-into per-job LOCAL scratch folders, runs labeling_with_truth_fixed.py, then
-STAGES OUT the labeled outputs to PNFS scratch via XRootD and deletes the local
-job folder so /scratch doesn't fill up.
+into per-job scratch folders, runs labeling_with_truth_fixed.py, and optionally cleans up.
 
 Truth interface (required by labeling_with_truth_fixed.py):
   --celltree-apa0 <path/to/celltree_apa0.root>
@@ -34,10 +32,9 @@ import shutil
 import logging
 import threading
 import re
-from typing import List, Tuple, Dict, Any
 
-# Runtime locations are environment-driven; scientific labeling options below
-# remain identical to the authoritative production workflow.
+# Runtime configuration is supplied through environment variables so this
+# production driver remains portable across EAF installations and users.
 XRDFS_HOST = os.environ.get("XRD_HOST", "fndcadoor.fnal.gov:1094")
 XRDCP_PREFIX = f"root://{XRDFS_HOST}"
 
@@ -46,20 +43,6 @@ PNFS_TRUTH_APA0_BASE = os.environ.get("NUGRAPH_TRUTH_APA0_BASE", "")
 PNFS_TRUTH_APA1_BASE = os.environ.get("NUGRAPH_TRUTH_APA1_BASE", "")
 SCRIPT_DIR = str(Path(__file__).resolve().parent)
 LOCAL_OUTPUT_BASE = Path(os.environ.get("NUGRAPH_LOCAL_OUTPUT_BASE", "labeled_samples"))
-PNFS_OUTPUT_BASE = os.environ.get("NUGRAPH_PNFS_OUTPUT_BASE", "")
-
-# What to stage out (relative to local job dir)
-STAGE_OUT_PATTERNS = [
-    "rec-lab-apa0-*.npz",
-    "rec-lab-apa1-*.npz",
-    "label_truth_*.log",
-    # keep the script copy/symlink for provenance (small)
-    "labeling_with_truth_fixed.py",
-    # If you want to keep celltree roots too (usually NO), uncomment:
-    # "celltree_apa0.root",
-    # "celltree_apa1.root",
-]
-
 JOBLIST_FILE = os.environ.get("NUGRAPH_JOBLIST", "")
 RECO_BATCHID = os.environ.get("NUGRAPH_RECO_BATCH_ID", "")
 CT0_BATCHID = os.environ.get("NUGRAPH_CT0_BATCH_ID", "")
@@ -74,14 +57,7 @@ XRDCP_RETRY_DELAY = 2.0
 BATCH_ENTRY_CHUNK = 16
 PYTHON_BIN = sys.executable
 
-# Cleanup policy:
-# - During processing: delete streamed rec/tru JSON/NPZ inputs after each chunk
-# - After job done: stage out labeled outputs to PNFS then delete local job folder
-CLEANUP_AFTER_LABEL = True
-
-# Stage-out behavior
-STAGE_OUT_ENABLED = bool(PNFS_OUTPUT_BASE)
-DELETE_LOCAL_JOB_DIR_AFTER_STAGEOUT = True  # delete local job folder ONLY if stage-out fully succeeds
+CLEANUP_AFTER_LABEL = True  # removes streamed rec/tru/root after each chunk; keeps rec-lab-*.npz + logs
 
 # ---------------------------
 # Token refresh configuration
@@ -147,7 +123,7 @@ def _increment_xrd_success_counter():
     return cnt
 
 
-def xrdcp_remote_to_local_with_retries(remote_path: str, local_path: Path, retries=XRDCP_RETRIES):
+def xrdcp_with_retries(remote_path: str, local_path: Path, retries=XRDCP_RETRIES):
     last_err = ""
     for attempt in range(1, retries + 1):
         cmd = ["xrdcp", "-f", remote_path, str(local_path)]
@@ -159,7 +135,7 @@ def xrdcp_remote_to_local_with_retries(remote_path: str, local_path: Path, retri
 
         auth_problem = (rc == 52) or ("Auth failed" in (err or "") or "Auth failed" in (out or ""))
         logging.warning(
-            "xrdcp (remote->local) failed attempt %d/%d for %s rc=%d. short error: %s",
+            "xrdcp failed attempt %d/%d for %s rc=%d. short error: %s",
             attempt, retries, remote_path, rc, (err.strip() or out.strip()),
         )
         if REACTIVE_REFRESH_ON_AUTH_FAIL and auth_problem:
@@ -170,73 +146,6 @@ def xrdcp_remote_to_local_with_retries(remote_path: str, local_path: Path, retri
                 continue
         time.sleep(XRDCP_RETRY_DELAY)
     return False, last_err
-
-
-def xrdcp_local_to_remote_with_retries(local_path: Path, remote_path: str, retries=XRDCP_RETRIES):
-    last_err = ""
-    for attempt in range(1, retries + 1):
-        cmd = ["xrdcp", "-f", str(local_path), remote_path]
-        rc, out, err = run_command(cmd, capture_output=True)
-        last_err = (out or "") + (err or "")
-        if rc == 0:
-            _increment_xrd_success_counter()
-            return True, out + err
-
-        auth_problem = (rc == 52) or ("Auth failed" in (err or "") or "Auth failed" in (out or ""))
-        logging.warning(
-            "xrdcp (local->remote) failed attempt %d/%d for %s rc=%d. short error: %s",
-            attempt, retries, remote_path, rc, (err.strip() or out.strip()),
-        )
-        if REACTIVE_REFRESH_ON_AUTH_FAIL and auth_problem:
-            logging.info("[TOKEN] detected auth failure; attempting htgettoken and retry immediately")
-            ok = refresh_htgettoken()
-            if ok:
-                time.sleep(0.5)
-                continue
-        time.sleep(XRDCP_RETRY_DELAY)
-    return False, last_err
-
-
-def xrdfs_mkdir_p(pnfs_dir: str) -> bool:
-    """
-    Create directory in dCache namespace via xrdfs.
-    pnfs_dir is an XRootD-visible destination directory.
-    """
-    if not shutil.which("xrdfs"):
-        logging.error("xrdfs not found in PATH; cannot create remote dir: %s", pnfs_dir)
-        return False
-    rc, out, err = run_command(["xrdfs", XRDFS_HOST, "mkdir", "-p", pnfs_dir], capture_output=True)
-    if rc != 0:
-        logging.warning("xrdfs mkdir failed for %s rc=%d err=%s out=%s", pnfs_dir, rc, err.strip(), out.strip())
-        return False
-    return True
-
-
-def stage_out_job_dir(local_job_dir: Path, pnfs_job_dir: str) -> Tuple[bool, List[str], List[str]]:
-    """
-    Stage out selected files from local_job_dir to pnfs_job_dir.
-    Copies CONTENTS (not the parent folder) to avoid double nesting.
-    Returns (ok_all, copied_files, failed_files)
-    """
-    ok_mkdir = xrdfs_mkdir_p(pnfs_job_dir)
-    if not ok_mkdir:
-        return False, [], [f"mkdir_failed:{pnfs_job_dir}"]
-
-    copied: List[str] = []
-    failed: List[str] = []
-
-    # Copy patterns
-    for pat in STAGE_OUT_PATTERNS:
-        for f in sorted(local_job_dir.glob(pat)):
-            remote = f"{XRDCP_PREFIX}//{pnfs_job_dir}/{f.name}"
-            ok, msg = xrdcp_local_to_remote_with_retries(f, remote)
-            if ok:
-                copied.append(f.name)
-            else:
-                failed.append(f"{f.name} :: {msg[:200]}")
-
-    ok_all = (len(failed) == 0)
-    return ok_all, copied, failed
 
 
 def ensure_symlink_labeling(out_folder: Path, script_dir: str):
@@ -344,7 +253,7 @@ def stream_celltree_roots(ct0_folder: str, ct1_folder: str, out_folder: Path):
     local1 = out_folder / "celltree_apa1.root"
 
     if not local0.exists():
-        ok, msg = xrdcp_remote_to_local_with_retries(remote0, local0)
+        ok, msg = xrdcp_with_retries(remote0, local0)
         if not ok:
             errors.append(f"celltree_apa0.root xrdcp failed: {remote0} ; last_err={msg[:200]}")
         else:
@@ -353,7 +262,7 @@ def stream_celltree_roots(ct0_folder: str, ct1_folder: str, out_folder: Path):
         local_files.append(local0)
 
     if not local1.exists():
-        ok, msg = xrdcp_remote_to_local_with_retries(remote1, local1)
+        ok, msg = xrdcp_with_retries(remote1, local1)
         if not ok:
             errors.append(f"celltree_apa1.root xrdcp failed: {remote1} ; last_err={msg[:200]}")
         else:
@@ -383,7 +292,7 @@ def stream_needed_files(reco_folder: str, truth_folder: str, out_folder: Path,
         tru_local = out_folder / f"tru-{apa}-{idx}.json"
 
         if not rec_local.exists():
-            ok, msg = xrdcp_remote_to_local_with_retries(rec_remote, rec_local)
+            ok, msg = xrdcp_with_retries(rec_remote, rec_local)
             if not ok:
                 errors.append(f"rec xrdcp failed: {rec_remote} ; last_err={msg[:200]}")
             else:
@@ -392,7 +301,7 @@ def stream_needed_files(reco_folder: str, truth_folder: str, out_folder: Path,
             local_files.append(rec_local)
 
         if not tru_local.exists():
-            ok, msg = xrdcp_remote_to_local_with_retries(tru_remote, tru_local)
+            ok, msg = xrdcp_with_retries(tru_remote, tru_local)
             if not ok:
                 errors.append(f"tru xrdcp failed: {tru_remote} ; last_err={msg[:200]}")
             else:
@@ -444,6 +353,7 @@ def run_labeling_in_folder(out_folder: Path, apa: str, start_idx: int, end_idx: 
         "--z-offset-cm", "0",
     ]
 
+
     env = os.environ.copy()
 
     # Add thread limits to prevent resource exhaustion in subprocesses
@@ -485,12 +395,8 @@ def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
         logging.warning("[JOB] SKIP (missing CT1 folder): %s", ct1_folder)
         return reco_folder, {"skipped": "missing_ct1"}
 
-    # Local working directory for this job
     out_folder = LOCAL_OUTPUT_BASE / job_name
     out_folder.mkdir(parents=True, exist_ok=True)
-
-    # PNFS stage-out directory for this job
-    pnfs_job_dir = f"{PNFS_OUTPUT_BASE}/{job_name}"
 
     # stream required ROOT files once per job
     ok_root, root_locals, root_errs, local_ct0_root, local_ct1_root = stream_celltree_roots(ct0_folder, ct1_folder, out_folder)
@@ -526,7 +432,7 @@ def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
     logging.info("[JOB] CT1 =%s", ct1_folder)
     logging.info("[JOB] Found max indices: APA0=%d, APA1=%d", max0, max1)
 
-    results: Dict[str, Any] = {"apa0": [], "apa1": [], "stageout": None}
+    results = {"apa0": [], "apa1": []}
 
     # apa1 then apa0
     for apa, max_event, truth_folder in (
@@ -569,30 +475,6 @@ def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
     if CLEANUP_AFTER_LABEL:
         cleanup_local_files(root_locals)
 
-    # ---------------------------
-    # STAGE OUT + DELETE LOCAL JOB DIR
-    # ---------------------------
-    if STAGE_OUT_ENABLED:
-        logging.info("[JOB %s] staging out to PNFS: %s", job_name, pnfs_job_dir)
-        ok_all, copied, failed = stage_out_job_dir(out_folder, pnfs_job_dir)
-        results["stageout"] = {
-            "pnfs_dir": pnfs_job_dir,
-            "ok_all": ok_all,
-            "copied_n": len(copied),
-            "failed_n": len(failed),
-            "failed": failed[:10],
-        }
-        if ok_all:
-            logging.info("[JOB %s] stage-out OK (%d files).", job_name, len(copied))
-            if DELETE_LOCAL_JOB_DIR_AFTER_STAGEOUT:
-                try:
-                    shutil.rmtree(out_folder, ignore_errors=True)
-                    logging.info("[JOB %s] deleted local job dir: %s", job_name, out_folder)
-                except Exception as e:
-                    logging.warning("[JOB %s] failed to delete local job dir %s: %s", job_name, out_folder, e)
-        else:
-            logging.warning("[JOB %s] stage-out had failures (%d). Keeping local dir: %s", job_name, len(failed), out_folder)
-
     return reco_folder, results
 
 
@@ -616,21 +498,13 @@ def main():
     if not shutil.which("xrdcp"):
         logging.error("xrdcp not found in PATH.")
         return 1
-    if not shutil.which("xrdfs"):
-        logging.error("xrdfs not found in PATH.")
-        return 1
 
     if BACKGROUND_REFRESH:
         background_token_refresher(BACKGROUND_REFRESH_INTERVAL)
 
-    # Local base must exist; this is only the local workspace root.
     LOCAL_OUTPUT_BASE.mkdir(parents=True, exist_ok=True)
 
-    # Ensure PNFS output base exists (best-effort)
-    if STAGE_OUT_ENABLED:
-        xrdfs_mkdir_p(PNFS_OUTPUT_BASE)
-
-    jobs: List[Tuple[str, str, str]] = []
+    jobs = []
     if JOBLIST_FILE and Path(JOBLIST_FILE).exists():
         lines = load_joblist(JOBLIST_FILE)
         for line in lines:

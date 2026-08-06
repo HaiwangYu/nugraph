@@ -2,11 +2,18 @@
 
 import argparse
 import re
+import sys
 from pathlib import Path
 
 import h5py
 import numpy as np
 import torch
+
+# Direct script execution places scripts/, not the repository root, on
+# sys.path. Add only this checkout's root so the integrated pywcml is used.
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from pywcml.config import ConversionConfig
 from pywcml.converter import WCMLConverter
