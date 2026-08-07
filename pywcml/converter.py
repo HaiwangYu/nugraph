@@ -415,8 +415,10 @@ class WCMLConverter:
 
         # ------------------------------------------------------
         # Blob-level edges:
-        #   - message passing: derived from ppedges (dense)
-        #   - supervision: derived from edge_index (balanced)
+        #   - message passing: derived from reconstruction ppedges
+        #   - supervision candidates: reconstruction-only union of mapped
+        #     ppedges, geometry kNN/radius, and reco-cluster neighbors
+        #   - supervision targets: assigned from blob-level truth afterward
         # ------------------------------------------------------
         
         mp_edge_index = self._get_blob_mp_edges(arrays=arrays, n_blobs=int(centroids.shape[0]))
@@ -809,6 +811,12 @@ class WCMLConverter:
         ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
             """
             Build blob candidates from reconstruction/geometry, then label with truth.
+
+            Candidate topology is exactly the union of mapped ``ppedges``,
+            geometry kNN/radius edges (k=8, radius=80 mm), and reconstruction
+            cluster-neighbor edges (k=4).  Labeler-owned ``arrays.edge_index``
+            and ``arrays.edge_y`` are intentionally ignored: they may depend on
+            truth and are retained in ``WCMLArrays`` only for legacy diagnostics.
             """
             if n_blobs <= 0:
                 return self._empty_edge_index(), np.empty((0,), dtype=np.int64), np.empty((0,), dtype=np.int64)
@@ -819,15 +827,6 @@ class WCMLConverter:
             if points is not None:
                 points = np.asarray(points)
                 if points.ndim == 2 and points.shape[1] >= 5 and points.shape[0] > 0:
-                    point_to_blob = points[:, 4].astype(np.int64, copy=False)
-                    existing_edges = self._point_edges_to_blob_edges(
-                        getattr(arrays, "edge_index", None),
-                        point_to_blob,
-                        n_blobs,
-                    )
-                    candidate_edges.append(existing_edges)
-                    source_counts["edge_index"] = int(existing_edges.shape[1])
-
                     ppedges = getattr(arrays, "ppedges", None)
                     if ppedges is not None and np.asarray(ppedges).size > 0:
                         try:

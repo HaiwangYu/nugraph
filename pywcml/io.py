@@ -26,6 +26,9 @@ class WCMLArrays:
     truth_blob_tid: Optional[np.ndarray]
     truth_blob_purity: Optional[np.ndarray]
     truth_blob_support: Optional[np.ndarray]
+    # Optional labeler-owned point-edge supervision.  These fields remain
+    # loadable for backward compatibility and diagnostics, but the NuGraph
+    # converter must not use them to construct topology or targets.
     edge_index: Optional[np.ndarray]
     edge_y: Optional[np.ndarray]
     # Keep track of origin path (converter uses this)
@@ -42,7 +45,7 @@ def load_npz(path: Path | str) -> WCMLArrays:
       - optional: is_nu, origin_label, ppedges
       - optional: vtx_dist, vtx_dx, vtx_dy, vtx_dz, nu_vtx, nu_vtx_found
       - optional: truth_blob_tid, truth_blob_purity, truth_blob_support
-      - optional: edge_index, edge_y
+      - optional diagnostic/legacy labeler output: edge_index, edge_y
     """
     path = Path(path)
     with np.load(path, allow_pickle=False) as data:
