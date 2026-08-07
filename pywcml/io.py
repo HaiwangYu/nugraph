@@ -1,22 +1,49 @@
-# filename: pywcml/io.py
+"""WCML in-memory array contracts and legacy NPZ compatibility loading."""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Mapping, Optional
 
 import numpy as np
 
 
+_DIRECT_FIELDS = {
+    "blobs",
+    "points",
+    "is_nu",
+    "ppedges",
+    "origin_label",
+    "vtx_dist",
+    "vtx_dx",
+    "vtx_dy",
+    "vtx_dz",
+    "nu_vtx",
+    "nu_vtx_found",
+    "truth_blob_tid",
+    "truth_blob_purity",
+    "truth_blob_support",
+    "edge_index",
+    "edge_y",
+}
+
+
 @dataclass
 class WCMLArrays:
+    """All arrays needed by the converter plus lossless labeler diagnostics.
+
+    ``path`` is optional and exists only for the historical filename-driven
+    route. Streaming callers construct this object directly and carry explicit
+    :class:`pywcml.identity.EventIdentity` instead.
+    """
+
     blobs: np.ndarray
     points: np.ndarray
     ctpc: Dict[str, np.ndarray]
     is_nu: Optional[np.ndarray]
     ppedges: np.ndarray
     origin_label: Optional[np.ndarray]
-    # Optional per-hit neutrino-vertex info
     vtx_dist: Optional[np.ndarray]
     vtx_dx: Optional[np.ndarray]
     vtx_dy: Optional[np.ndarray]
@@ -26,71 +53,92 @@ class WCMLArrays:
     truth_blob_tid: Optional[np.ndarray]
     truth_blob_purity: Optional[np.ndarray]
     truth_blob_support: Optional[np.ndarray]
-    # Optional labeler-owned point-edge supervision.  These fields remain
-    # loadable for backward compatibility and diagnostics, but the NuGraph
-    # converter must not use them to construct topology or targets.
+    # Labeler-owned point-edge supervision remains loadable for diagnostics
+    # and legacy workflows. It never constructs NuGraph topology or targets.
     edge_index: Optional[np.ndarray]
     edge_y: Optional[np.ndarray]
-    # Keep track of origin path (converter uses this)
-    path: Path
+    path: Optional[Path] = None
+    # Point truth, per-plane truth, and any source-specific arrays not consumed
+    # directly by the converter are retained here for lossless CLI round trips.
+    extras: Dict[str, np.ndarray] = field(default_factory=dict)
 
+    @classmethod
+    def from_mapping(
+        cls,
+        arrays: Mapping[str, np.ndarray],
+        *,
+        path: Path | str | None = None,
+    ) -> "WCMLArrays":
+        """Construct from an already-materialized mapping without serialization."""
 
-def load_npz(path: Path | str) -> WCMLArrays:
-    """
-    Load a WCML-style NPZ file and return a WCMLArrays bundle.
-
-    This includes:
-      - required: blobs, points
-      - ctpc_* plane arrays
-      - optional: is_nu, origin_label, ppedges
-      - optional: vtx_dist, vtx_dx, vtx_dy, vtx_dz, nu_vtx, nu_vtx_found
-      - optional: truth_blob_tid, truth_blob_purity, truth_blob_support
-      - optional diagnostic/legacy labeler output: edge_index, edge_y
-    """
-    path = Path(path)
-    with np.load(path, allow_pickle=False) as data:
-        blobs = data["blobs"]
-        points = data["points"]
-        ctpc = {key: data[key] for key in data.files if key.startswith("ctpc_")}
+        if "blobs" not in arrays or "points" not in arrays:
+            raise KeyError("WCML arrays require 'blobs' and 'points'")
 
         def optional(key: str) -> Optional[np.ndarray]:
-            return data[key] if key in data.files else None
+            return arrays.get(key)
 
-        is_nu = optional("is_nu")
-        origin_label = optional("origin_label")
         ppedges = optional("ppedges")
         if ppedges is None:
             ppedges = np.empty((0, 3), dtype=np.float32)
 
-        vtx_dist = optional("vtx_dist")
-        vtx_dx = optional("vtx_dx")
-        vtx_dy = optional("vtx_dy")
-        vtx_dz = optional("vtx_dz")
-        nu_vtx = optional("nu_vtx")
-        nu_vtx_found = optional("nu_vtx_found")
-        truth_blob_tid = optional("truth_blob_tid")
-        truth_blob_purity = optional("truth_blob_purity")
-        truth_blob_support = optional("truth_blob_support")
-        edge_index = optional("edge_index")
-        edge_y = optional("edge_y")
+        ctpc = {key: value for key, value in arrays.items() if key.startswith("ctpc_")}
+        extras = {
+            key: value
+            for key, value in arrays.items()
+            if key not in _DIRECT_FIELDS and not key.startswith("ctpc_")
+        }
+        return cls(
+            blobs=arrays["blobs"],
+            points=arrays["points"],
+            ctpc=ctpc,
+            is_nu=optional("is_nu"),
+            ppedges=ppedges,
+            origin_label=optional("origin_label"),
+            vtx_dist=optional("vtx_dist"),
+            vtx_dx=optional("vtx_dx"),
+            vtx_dy=optional("vtx_dy"),
+            vtx_dz=optional("vtx_dz"),
+            nu_vtx=optional("nu_vtx"),
+            nu_vtx_found=optional("nu_vtx_found"),
+            truth_blob_tid=optional("truth_blob_tid"),
+            truth_blob_purity=optional("truth_blob_purity"),
+            truth_blob_support=optional("truth_blob_support"),
+            edge_index=optional("edge_index"),
+            edge_y=optional("edge_y"),
+            path=Path(path) if path is not None else None,
+            extras=extras,
+        )
 
-    return WCMLArrays(
-        blobs=blobs,
-        points=points,
-        ctpc=ctpc,
-        is_nu=is_nu,
-        ppedges=ppedges,
-        origin_label=origin_label,
-        vtx_dist=vtx_dist,
-        vtx_dx=vtx_dx,
-        vtx_dy=vtx_dy,
-        vtx_dz=vtx_dz,
-        nu_vtx=nu_vtx,
-        nu_vtx_found=nu_vtx_found,
-        truth_blob_tid=truth_blob_tid,
-        truth_blob_purity=truth_blob_purity,
-        truth_blob_support=truth_blob_support,
-        edge_index=edge_index,
-        edge_y=edge_y,
-        path=path,
-    )
+    def to_mapping(self) -> Dict[str, np.ndarray]:
+        """Return the historical NPZ payload mapping without writing it."""
+
+        result = dict(self.extras)
+        result.update(self.ctpc)
+        result["blobs"] = self.blobs
+        result["points"] = self.points
+        result["ppedges"] = self.ppedges
+        for key in _DIRECT_FIELDS - {"blobs", "points", "ppedges"}:
+            value = getattr(self, key)
+            if value is not None:
+                result[key] = value
+        return result
+
+    def __getattr__(self, name: str):
+        """Expose retained diagnostic arrays to existing converter helpers."""
+
+        extras = self.__dict__.get("extras", {})
+        if name in extras:
+            return extras[name]
+        raise AttributeError(name)
+
+
+def load_npz(path: Path | str) -> WCMLArrays:
+    """Load a legacy WCML NPZ archive into the common in-memory contract."""
+
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as data:
+        payload = {key: data[key] for key in data.files}
+    return WCMLArrays.from_mapping(payload, path=path)
+
+
+__all__ = ["WCMLArrays", "load_npz"]

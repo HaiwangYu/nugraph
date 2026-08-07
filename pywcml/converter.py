@@ -18,6 +18,7 @@ from pynuml.data import NuGraphData
 
 from .config import ConversionConfig, PlaneSpec
 from .geometry import project_corners, triangulation_edges
+from .identity import EventIdentity
 from .io import WCMLArrays, load_npz
 
 # Optional sklearn import for local PCA; if unavailable, we fall back to zeros.
@@ -59,7 +60,7 @@ def _materialize_graph(graph: NuGraphData) -> NuGraphData:
 
 
 class WCMLConverter:
-    """Convert WCML NPZ archives into NuGraph graphs and packaged HDF5 files."""
+    """Convert WCML arrays into NuGraph graphs and packaged HDF5 files."""
 
     def __init__(self, config: ConversionConfig | None = None):
         self.config = config or ConversionConfig()
@@ -68,11 +69,39 @@ class WCMLConverter:
     # Public API
     # ------------------------------------------------------------------
     def convert(self, npz_path: Path | str, sample_name: str | None = None) -> tuple[str, NuGraphData]:
+        """Compatibility loader for the historical NPZ-driven route."""
+
         path = Path(npz_path)
         arrays = load_npz(path)
         graph_name = sample_name or self._default_sample_name(path)
         graph = self._build_graph(graph_name, arrays)
         return graph_name, graph
+
+    def convert_arrays(
+        self,
+        arrays: WCMLArrays,
+        identity: EventIdentity,
+        apa: int,
+        sample_name: str | None = None,
+    ) -> NuGraphData:
+        """Convert an in-memory APA payload using explicit physical identity.
+
+        Unlike :meth:`convert`, this supported streaming API never consults a
+        filename or ``WCMLArrays.path`` for provenance. The APA selects the
+        correct SBND plane family while run/subrun/event are copied directly
+        from ``identity``.
+        """
+
+        if isinstance(apa, bool) or int(apa) not in (0, 1):
+            raise ValueError(f"APA must be 0 or 1, got {apa!r}")
+        apa = int(apa)
+        graph_name = sample_name or identity.sample_name(apa)
+        return self._build_graph(
+            graph_name,
+            arrays,
+            identity=identity,
+            apa=apa,
+        )
 
     def convert_many(self, paths: Sequence[Path | str], workers: int | None = None) -> Dict[str, NuGraphData]:
         graphs: Dict[str, NuGraphData] = {}
@@ -151,7 +180,14 @@ class WCMLConverter:
     # ------------------------------------------------------------------
     # Core conversion logic
     # ------------------------------------------------------------------
-    def _build_graph(self, sample_name: str, arrays: WCMLArrays) -> NuGraphData:
+    def _build_graph(
+        self,
+        sample_name: str,
+        arrays: WCMLArrays,
+        *,
+        identity: EventIdentity | None = None,
+        apa: int | None = None,
+    ) -> NuGraphData:
         """
         Build one NuGraphData event.
 
@@ -275,7 +311,8 @@ class WCMLConverter:
         
 
         # --- Plane-level nodes (per-plane clusters) ---
-        planes = self.config.planes_for_sample(sample_name)
+        plane_selector = sample_name if apa is None else f"apa{apa}"
+        planes = self.config.planes_for_sample(plane_selector)
         plane_nodes: Dict[str, PlaneNodes] = {}
         for key, spec in planes.items():
             ctpc = arrays.ctpc.get(key)
@@ -312,7 +349,10 @@ class WCMLConverter:
 
         # --- Assemble NuGraphData ---
         graph = NuGraphData()
-        run, subrun, event = self._infer_event_ids(sample_name, arrays.path)
+        if identity is None:
+            run, subrun, event = self._infer_event_ids(sample_name, arrays.path)
+        else:
+            run, subrun, event = identity.run, identity.subrun, identity.event
         graph["metadata"].run = run
         graph["metadata"].subrun = subrun
         graph["metadata"].event = event
