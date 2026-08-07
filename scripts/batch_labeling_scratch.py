@@ -14,6 +14,10 @@ Truth interface (required by labeling_with_truth_fixed.py):
 Job pairing is done by matching suffix "_N" across stage folders:
     img-clus/<imgBatch>_N  <->  celltree0/<ct0Batch>_N  <->  celltree1/<ct1Batch>_N
 even when <imgBatch> != <ct0Batch> != <ct1Batch>.
+
+Point-level edge supervision is disabled by default because NuGraph4 HDF5
+conversion constructs candidate topology from reconstruction-only inputs.  Use
+--legacy-edge-supervision only for legacy or diagnostic NPZ workflows.
 """
 
 import os
@@ -26,6 +30,7 @@ os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import argparse
 import subprocess
 import sys
 import time
@@ -36,8 +41,8 @@ import threading
 import re
 from typing import List, Tuple, Dict, Any
 
-# Runtime locations are environment-driven; scientific labeling options below
-# remain identical to the authoritative production workflow.
+# Runtime locations are environment-driven. Legacy point-level edge supervision
+# is enabled only by the explicit command-line option documented above.
 XRDFS_HOST = os.environ.get("XRD_HOST", "fndcadoor.fnal.gov:1094")
 XRDCP_PREFIX = f"root://{XRDFS_HOST}"
 
@@ -404,7 +409,8 @@ def stream_needed_files(reco_folder: str, truth_folder: str, out_folder: Path,
 
 
 def run_labeling_in_folder(out_folder: Path, apa: str, start_idx: int, end_idx: int,
-                           celltree0_local: Path, celltree1_local: Path, script_dir_local: str):
+                           celltree0_local: Path, celltree1_local: Path, script_dir_local: str,
+                           legacy_edge_supervision: bool = False):
     ensure_symlink_labeling(out_folder, script_dir_local)
     entries_arg = f"{start_idx}-{end_idx}"
     logname = out_folder / f"label_truth_{apa}_{start_idx}_{end_idx}.log"
@@ -437,12 +443,17 @@ def run_labeling_in_folder(out_folder: Path, apa: str, start_idx: int, end_idx: 
         # THE HERO FLAG (Track B): direct ctpc->point matching radius
         "--max-dist-mm", "10.0",          # mm
 
-        # --- edge supervision written into NPZ ---
-        "--write-edge-sup",
-        "--balance-edges",
-        "--neg-radius-mm", "60",
         "--z-offset-cm", "0",
     ]
+
+    # NuGraph4 builds candidate edges from reconstruction-only sources, so the
+    # labeler's point-level edge arrays are a legacy/diagnostic opt-in only.
+    if legacy_edge_supervision:
+        cmd.extend([
+            "--write-edge-sup",
+            "--balance-edges",
+            "--neg-radius-mm", "60",
+        ])
 
     env = os.environ.copy()
 
@@ -469,7 +480,8 @@ def run_labeling_in_folder(out_folder: Path, apa: str, start_idx: int, end_idx: 
     return (proc.returncode == 0), str(logname)
 
 
-def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
+def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str,
+                legacy_edge_supervision: bool = False):
     job_name = os.path.basename(reco_folder)
     logging.info("[JOB] Starting %s", job_name)
 
@@ -556,6 +568,7 @@ def process_job(reco_folder: str, ct0_folder: str, ct1_folder: str):
                 celltree0_local=local_ct0_root,
                 celltree1_local=local_ct1_root,
                 script_dir_local=SCRIPT_DIR,
+                legacy_edge_supervision=legacy_edge_supervision,
             )
             if not ok_run:
                 results[apa].append(("label_failed", start, end, logpath))
@@ -612,7 +625,23 @@ def background_token_refresher(interval_seconds=BACKGROUND_REFRESH_INTERVAL):
     return t
 
 
-def main():
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--legacy-edge-supervision",
+        action="store_true",
+        help=(
+            "write balanced point-level edge_index/edge_y using a 60 mm "
+            "negative radius (legacy/diagnostic only; not needed for "
+            "NuGraph4 HDF5 conversion)"
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+
     if not shutil.which("xrdcp"):
         logging.error("xrdcp not found in PATH.")
         return 1
@@ -656,12 +685,15 @@ def main():
         return 2
 
     logging.info("Will process %d jobs with max_workers=%d, chunk=%d", len(jobs), MAX_WORKERS, BATCH_ENTRY_CHUNK)
+    logging.info("Legacy point-level edge supervision: %s", args.legacy_edge_supervision)
     logging.info("First few jobs: %s", jobs[:5])
 
     futures = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         for reco, ct0, ct1 in jobs:
-            futures.append(ex.submit(process_job, reco, ct0, ct1))
+            futures.append(ex.submit(
+                process_job, reco, ct0, ct1, args.legacy_edge_supervision
+            ))
 
         for fut in as_completed(futures):
             try:
